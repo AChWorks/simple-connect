@@ -234,6 +234,105 @@ class HostKeyTests(unittest.TestCase):
             self.assertTrue(pub.is_file())
             self.assertFalse(any(x[0] == "ssh-keyscan" for x in calls))
 
+    def test_server_summary_prefers_copy_ready_ed25519_and_keeps_details_advanced(self):
+        import os
+        fp_ed = "SHA256:" + "E" * 43
+        fp_rsa = "SHA256:" + "R" * 43
+        report = {
+            "active": True, "ports": [56777], "configured": True,
+            "observed": [{"port": 56777, "identities": [
+                {"type": "ssh-ed25519", "fingerprint": fp_ed},
+                {"type": "ssh-rsa", "fingerprint": fp_rsa},
+            ]}],
+            "notes": [],
+            "keys": [
+                {"type": "ssh-rsa", "fingerprint": fp_rsa, "enabled": True,
+                 "private": "PAIR MATCH", "path": "/etc/ssh/host_rsa.pub",
+                 "status": "configured; listener unverified"},
+                {"type": "ssh-ed25519", "fingerprint": fp_ed, "enabled": True,
+                 "private": "PAIR MATCH", "path": "/etc/ssh/host_ed.pub",
+                 "status": "observed on localhost"},
+                {"type": "ssh-dss", "fingerprint": "", "enabled": False,
+                 "private": "NOT VERIFIED", "path": "/etc/ssh/host_dsa.pub",
+                 "status": "UNSUPPORTED (DSA)"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            role = Path(d) / "role"
+            role.write_text("server\n")
+            with (
+                patch.object(sc, "ETC", Path(d)),
+                patch.object(sc, "require_root"),
+                patch.object(sc, "server_host_report", return_value=report),
+                patch.object(sc.shutil, "get_terminal_size",
+                             return_value=os.terminal_size((40, 24))),
+            ):
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    sc.show_server_host_fingerprints(probe=True)
+                summary = out.getvalue()
+                self.assertIn("ED25519", summary)
+                self.assertIn("\n" + fp_ed + "\n", summary)
+                self.assertNotIn(fp_rsa, summary)
+                self.assertNotIn("host_dsa.pub", summary)
+                self.assertIn("localhost port(s): 56777", summary)
+                self.assertIn("UNVERIFIED", summary)
+                for line in summary.splitlines():
+                    if not line.startswith("SHA256:"):
+                        self.assertLessEqual(len(line), 39, line)
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    sc.show_server_host_fingerprints(probe=True, advanced=True)
+                detail = out.getvalue()
+                self.assertIn(fp_rsa, detail)
+                self.assertIn("ssh-dss", detail)
+                self.assertIn("host_dsa.pub", detail)
+                self.assertIn("UNSUPPORTED", detail)
+
+    def test_server_summary_falls_back_to_configured_ecdsa_if_ed25519_is_unready(self):
+        fp = "SHA256:" + "C" * 43
+        report = {
+            "active": True, "ports": [22022], "configured": True,
+            "observed": [], "notes": [],
+            "keys": [
+                {"type": "ssh-ed25519", "fingerprint": "", "enabled": False,
+                 "private": "MISSING", "path": "/etc/ssh/host_ed.pub",
+                 "status": "HOST KEY NOT READY"},
+                {"type": "ecdsa-sha2-nistp256", "fingerprint": fp, "enabled": True,
+                 "private": "PAIR MATCH", "path": "/etc/ssh/host_ecdsa.pub",
+                 "status": "configured; listener unverified"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "role").write_text("server\n")
+            with patch.object(sc, "ETC", Path(d)), (
+                 patch.object(sc, "require_root")), (
+                 patch.object(sc, "server_host_report", return_value=report)), (
+                 contextlib.redirect_stdout(io.StringIO())) as out:
+                sc.show_server_host_fingerprints(probe=False)
+        self.assertIn("ECDSA (ecdsa-sha2-nistp256)", out.getvalue())
+        self.assertIn(fp, out.getvalue())
+        self.assertIn("other host key(s)", out.getvalue())
+        self.assertNotIn("SSH listener READY", out.getvalue())
+
+    def test_server_summary_with_no_safe_identity_never_suggests_unsupported_key(self):
+        report = {
+            "active": False, "ports": [], "configured": False,
+            "observed": [], "notes": ["sshd config unavailable"],
+            "keys": [{"type": "ssh-dss", "fingerprint": "", "enabled": False,
+                      "private": "MISSING", "path": "/etc/ssh/host_dsa.pub",
+                      "status": "UNSUPPORTED (DSA)"}],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "role").write_text("server\n")
+            with patch.object(sc, "ETC", Path(d)), (
+                 patch.object(sc, "require_root")), (
+                 patch.object(sc, "server_host_report", return_value=report)), (
+                 contextlib.redirect_stdout(io.StringIO())) as out:
+                sc.show_server_host_fingerprints(probe=True)
+        self.assertIn("NO SAFE SUPPORTED", out.getvalue())
+        self.assertIn("NOT VERIFIED ACTIVE", out.getvalue())
+        self.assertIn("port is unknown", out.getvalue())
+        self.assertNotIn("Recommended SERVER host key:", out.getvalue())
+
     def test_rsa_enrollment_uses_sha2_only_and_frozen_known_hosts(self):
         with tempfile.TemporaryDirectory() as d:
             folder = Path(d)
@@ -354,7 +453,7 @@ class HostKeyTests(unittest.TestCase):
                     sc.setup("server", "ignored-wheel")
             self.assertIn("SHA256:", first.getvalue())
             self.assertIn("SHA256:", second.getvalue())
-            self.assertIn("ecdsa-sha2-nistp256", second.getvalue())
+            self.assertIn("Recommended SERVER host key: ECDSA (ecdsa-sha2-nistp256)", second.getvalue())
             self.assertEqual((etc/"role").read_text(), "server\n")
             self.assertEqual(pub.read_bytes(), original_public)
             self.assertEqual(key.read_bytes(), original_private)
@@ -484,6 +583,194 @@ class HostKeyTests(unittest.TestCase):
             execute.assert_not_called()
             self.assertFalse(report["configured"])
             self.assertIn("Unsafe sshd executable", " ".join(report["notes"]))
+
+
+    def test_server_prefers_observed_supported_identity_when_ed25519_not_offered(self):
+        report = {
+            "active": True, "ports": [22222], "configured": True, "notes": [],
+            "observed": [{"port": 22222, "identities": [
+                {"type": "ecdsa-sha2-nistp256", "fingerprint": "SHA256:" + "C" * 43}
+            ]}],
+            "keys": [
+                {"type": "ssh-ed25519", "fingerprint": "SHA256:" + "E" * 43,
+                 "enabled": True, "status": "FILE PRESENT",
+                 "private": "PAIR MATCH", "path": "/etc/ssh/ed25519.pub"},
+                {"type": "ecdsa-sha2-nistp256", "fingerprint": "SHA256:" + "C" * 43,
+                 "enabled": True, "status": "OBSERVED on localhost",
+                 "private": "PAIR MATCH", "path": "/etc/ssh/ecdsa.pub"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "role").write_text("server\n")
+            with patch.object(sc, "ETC", Path(d)), patch.object(sc, "require_root"), (
+                 patch.object(sc, "server_host_report", return_value=report)), (
+                 contextlib.redirect_stdout(io.StringIO())) as output:
+                sc.show_server_host_fingerprints(probe=True, advanced=True)
+        result = output.getvalue()
+        first = result.split("Advanced SERVER host key diagnostics")[0]
+        self.assertIn("ECDSA (ecdsa-sha2-nistp256)", first)
+        self.assertIn("SHA256:" + "C" * 43, first)
+        self.assertNotIn("SHA256:" + "E" * 43, first)
+        self.assertIn("SHA256:" + "E" * 43, result)
+        self.assertIn("/etc/ssh/ed25519.pub", result)
+
+    def test_duplicate_ed25519_keys_match_only_exact_observed_fingerprint(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            (folder / "role").write_text("server\n")
+            first = self.key(folder, "first_ed", "ed25519")
+            second = self.key(folder, "second_ed", "ed25519")
+            keys = [first, second]
+            fingerprints = {key: self.record(key)[1] for key in keys}
+            observed_key = first
+            original = sc.run
+
+            def fake(argv, **kwargs):
+                if argv[0] == "/usr/sbin/sshd":
+                    config = ("port 24001\n"
+                              + "".join(f"hostkey {key}\n" for key in keys)
+                              + "hostkeyalgorithms ssh-ed25519\n")
+                    return subprocess.CompletedProcess(argv, 0, config, "")
+                if argv[0] == "ssh-keyscan":
+                    record = Path(str(observed_key) + ".pub").read_text().split()
+                    row = f"127.0.0.1 {record[0]} {record[1]}\n"
+                    return subprocess.CompletedProcess(argv, 0, row, "")
+                return original(argv, **kwargs)
+
+            with (
+                patch.object(sc, "ETC", folder),
+                patch.object(sc, "SSH_HOST_DIR", folder),
+                patch.object(sc, "is_active", return_value=True),
+                patch.object(sc, "run", side_effect=fake),
+                patch.object(sc, "require_root"),
+            ):
+                for offered in (second, first):
+                    with self.subTest(offered=offered.name):
+                        observed_key = offered
+                        report = sc.server_host_report(probe=True)
+                        self.assertEqual(report["observed"], [{
+                            "port": 24001,
+                            "identities": [{"type": "ssh-ed25519",
+                                            "fingerprint": fingerprints[offered]}],
+                        }])
+                        for entry in report["keys"]:
+                            expected_ports = ([24001] if entry["fingerprint"] == fingerprints[offered]
+                                              else [])
+                            self.assertEqual(entry["observed_ports"], expected_ports)
+                            if not expected_ports:
+                                self.assertNotIn("OBSERVED", entry["status"])
+                        with contextlib.redirect_stdout(io.StringIO()) as output:
+                            sc.show_server_host_fingerprints(probe=True, advanced=False)
+                        summary = output.getvalue()
+                        self.assertIn(fingerprints[offered], summary)
+                        self.assertNotIn(fingerprints[first if offered == second else second], summary)
+                        self.assertIn("localhost port(s): 24001", summary)
+                        self.assertNotIn("AMBIGUOUS", summary)
+                        self.assertIn("UNVERIFIED", summary)
+
+    def test_two_observed_ed25519_keys_on_different_ports_are_ambiguous(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            (folder / "role").write_text("server\n")
+            first = self.key(folder, "port1_ed", "ed25519")
+            second = self.key(folder, "port2_ed", "ed25519")
+            first_fp, second_fp = self.record(first)[1], self.record(second)[1]
+            original = sc.run
+
+            def fake(argv, **kwargs):
+                if argv[0] == "/usr/sbin/sshd":
+                    return subprocess.CompletedProcess(argv, 0,
+                        f"port 24001\nport 24002\nhostkey {first}\nhostkey {second}\n"
+                        "hostkeyalgorithms ssh-ed25519\n", "")
+                if argv[0] == "ssh-keyscan":
+                    port = int(argv[argv.index("-p") + 1])
+                    offered = first if port == 24001 else second
+                    fields = Path(str(offered) + ".pub").read_text().split()
+                    return subprocess.CompletedProcess(argv, 0,
+                        f"127.0.0.1 {fields[0]} {fields[1]}\n", "")
+                return original(argv, **kwargs)
+
+            with (
+                patch.object(sc, "ETC", folder),
+                patch.object(sc, "SSH_HOST_DIR", folder),
+                patch.object(sc, "is_active", return_value=True),
+                patch.object(sc, "run", side_effect=fake),
+                patch.object(sc, "require_root"),
+            ):
+                report = sc.server_host_report(probe=True)
+                self.assertEqual(len(report["observed"]), 2)
+                self.assertEqual(report["keys"][0]["observed_ports"], [24001])
+                self.assertEqual(report["keys"][1]["observed_ports"], [24002])
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    sc.show_server_host_fingerprints(probe=True, advanced=True)
+                display = out.getvalue()
+                primary = display.split("Advanced SERVER host key diagnostics")[0]
+                self.assertIn("AMBIGUOUS", primary)
+                self.assertNotIn("Recommended SERVER host key", primary)
+                self.assertNotIn(first_fp, primary)
+                self.assertNotIn(second_fp, primary)
+                self.assertIn(first_fp, display)
+                self.assertIn(second_fp, display)
+                self.assertIn("24001", display)
+                self.assertIn("24002", display)
+
+    def test_unobserved_same_type_keys_cannot_claim_listener_match(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            (folder / "role").write_text("server\n")
+            first = self.key(folder, "first_ed", "ed25519")
+            second = self.key(folder, "second_ed", "ed25519")
+            original = sc.run
+
+            def fake(argv, **kwargs):
+                if argv[0] == "/usr/sbin/sshd":
+                    return subprocess.CompletedProcess(argv, 0,
+                        f"port 24001\nhostkey {first}\nhostkey {second}\n"
+                        "hostkeyalgorithms ssh-ed25519\n", "")
+                if argv[0] == "ssh-keyscan":
+                    return subprocess.CompletedProcess(argv, 1, "", "not listening")
+                return original(argv, **kwargs)
+
+            with (
+                patch.object(sc, "ETC", folder),
+                patch.object(sc, "SSH_HOST_DIR", folder),
+                patch.object(sc, "is_active", return_value=True),
+                patch.object(sc, "run", side_effect=fake),
+                patch.object(sc, "require_root"),
+            ):
+                report = sc.server_host_report(probe=True)
+                self.assertEqual(report["observed"], [])
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    sc.show_server_host_fingerprints(probe=True)
+                self.assertIn("AMBIGUOUS", out.getvalue())
+                self.assertIn("No matching localhost host key observed", out.getvalue())
+                self.assertNotIn("Matched on localhost", out.getvalue())
+
+    def test_server_summary_at_40_and_80_columns_keeps_copy_token(self):
+        report = {
+            "active": True, "ports": [56777], "configured": True,
+            "observed": [{"port": 56777, "identities": [
+                {"type": "ssh-ed25519", "fingerprint": "SHA256:" + "E" * 43}
+            ]}],
+            "notes": [],
+            "keys": [{"type": "ssh-ed25519", "fingerprint": "SHA256:" + "E" * 43,
+                      "enabled": True, "status": "OBSERVED",
+                      "private": "PAIR MATCH", "path": "/etc/ssh/host.pub"}],
+        }
+        for width in (40, 80):
+            with self.subTest(width=width), tempfile.TemporaryDirectory() as d:
+                (Path(d) / "role").write_text("server\n")
+                with patch.object(sc, "ETC", Path(d)), patch.object(sc, "require_root"), (
+                     patch.object(sc, "server_host_report", return_value=report)), (
+                     patch.object(sc.shutil, "get_terminal_size",
+                                  return_value=os.terminal_size((width, 24)))), (
+                     contextlib.redirect_stdout(io.StringIO())) as output:
+                    sc.show_server_host_fingerprints(probe=True)
+                rows = output.getvalue().splitlines()
+                self.assertEqual([line for line in rows if line.startswith("SHA256:")],
+                                 ["SHA256:" + "E" * 43])
+                self.assertTrue(all(len(row) <= width - 1 or row.startswith("SHA256:")
+                                    for row in rows), rows)
 
 
 if __name__ == "__main__":

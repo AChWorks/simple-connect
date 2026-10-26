@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 readonly OFFICIAL_MANAGER="https://raw.githubusercontent.com/AChWorks/simple-connect/main/simple_connect.py"
 readonly OFFICIAL_WHEEL="https://files.pythonhosted.org/packages/25/1d/c409e26b9d5d26e6f07466c3d4662abb1c3ca4810424f66f38e1b5e54f33/sshuttle-2.0.0-py3-none-any.whl"
-readonly MANAGER_SHA256="e45a21f7ab69b4fb45ae8c383471cf694da085a699017a24674e3ec790d02b49"
+readonly MANAGER_SHA256="147e766bde48c302fd3bfe7c032c6f4d8c253ec35d71ca5e071cc4da421c823a"
 readonly WHEEL_SHA256="506a8cad2f047ca42f0d784654cb3459e2193bfad79d0a03734e0e07473f2bbb"
 readonly DEFAULT_MIRROR="https://helpe.ir/simple-connect"
 

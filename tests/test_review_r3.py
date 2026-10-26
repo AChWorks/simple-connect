@@ -86,7 +86,7 @@ class EnrollmentAuthorizationTests(unittest.TestCase):
             consent_args = []
             did_change = []
             def prompt(question):
-                if "Trusted remote" in question:
+                if "Trusted" in question and "fingerprint" in question:
                     return data["8.8.8.8"][1]
                 if "Authorize public-key enrollment" in question:
                     consent_args.append(question)
