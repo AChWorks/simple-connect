@@ -93,7 +93,16 @@ def main() -> int:
                 raise AssertionError("Unsafe enrollment parameters")
             (root / "enrollment-simulated").write_text("PUBLIC key only (no remote call)\n")
             return subprocess.CompletedProcess(argv, 0, "", "")
-        return original_subprocess(argv, *args, **kwargs)
+        # Allow only the actual local cryptographic tool or the manager's
+        # read-only interface query. A future source change must NOT silently
+        # cause a live network, systemd or firewall operation in this fixture.
+        if isinstance(argv, (list, tuple)) and argv and argv[0] == "ssh-keygen":
+            return original_subprocess(argv, *args, **kwargs)
+        if list(argv) == ["ip", "-j", "-4", "address", "show", "scope", "global"]:
+            addresses = [{"ifname": "eth0", "addr_info": [
+                {"family": "inet", "local": "198.51.100.100"}]}]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(addresses), "")
+        raise AssertionError(f"Blocked unexpected direct subprocess in PTY fixture: {argv}")
 
     patches = [
         patch.object(sc, "ETC", root / "etc"),
