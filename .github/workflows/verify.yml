@@ -1,0 +1,25 @@
+name: Verify source and mirror
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  source-and-mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Static syntax and unit regression
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 -m py_compile simple_connect.py
+          bash -n install.sh scripts/build-mirror-bundle.sh
+          python3 -m unittest discover -s tests -v
+      - name: Verify independent mirror artifact checksums
+        run: |
+          set -euo pipefail
+          bash scripts/build-mirror-bundle.sh
+          (cd dist/simple-connect-mirror && sha256sum -c SHA256SUMS)
