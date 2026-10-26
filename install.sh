@@ -74,7 +74,9 @@ printf '%s  %s\n' "$MANAGER_SHA256" "$temp/simple_connect.py" | sha256sum --chec
 info "Manager SHA-256 verified."
 
 # A piped shell script needs /dev/tty for interactive setup.
-if [[ -r /dev/tty ]]; then
+# /dev/tty can exist but have no controlling terminal (cron, Docker, CI).
+# A read-permission check alone is insufficient; probe a real open first.
+if ( : </dev/tty ) 2>/dev/null; then
     exec 3< /dev/tty
     python3 "$temp/simple_connect.py" setup "$role" --wheel-url "$wheel_url" <&3
     exec 3<&-

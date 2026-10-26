@@ -214,6 +214,8 @@ class SimpleConnectTests(unittest.TestCase):
         expected = hashlib.sha256((repo / "simple_connect.py").read_bytes()).hexdigest()
         self.assertIn('MANAGER_SHA256="' + expected + '"', boot)
         self.assertIn(sc.WHEEL_SHA256, boot)
+        self.assertIn('DEFAULT_MIRROR="https://helpe.ir/simple-connect"', boot)
+        self.assertIn('if ( : </dev/tty ) 2>/dev/null; then', boot)
 
     def test_help_is_nonprivileged_and_no_host_effect(self):
         app = Path(__file__).resolve().parents[1] / "simple_connect.py"
