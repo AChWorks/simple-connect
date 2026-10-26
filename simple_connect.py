@@ -8,6 +8,8 @@ creation/enrollment is an explicit, separate interactive step.
 from __future__ import annotations
 
 import argparse
+import base64
+import errno
 import contextlib
 import fcntl
 import hashlib
@@ -17,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import shlex
 import shutil
 import socket
@@ -662,48 +665,129 @@ def valid_port(value: str) -> int:
     fail("SSH port must be an integer in the range 1..65535.")
 
 
+# ssh-copy-id uses shell evaluation around its -i filename. We must never
+# interpolate a user-selected pathname containing shell syntax into that helper.
+SAFE_KEY_PATH = re.compile(r"/[A-Za-z0-9_./-]+")
+
+
+def checked_key_name(value: str) -> Path:
+    path = Path(value)
+    if (not path.is_absolute() or not SAFE_KEY_PATH.fullmatch(value)
+            or any(part in (".", "..") for part in value.split("/"))):
+        fail("Unsafe SSH identity path. Use an absolute path with only letters, digits, /, ., _ or -.")
+    return path
+
+
+def trusted_key_parents(folder: Path) -> None:
+    """Reject replaceable parents; /tmp is accepted only as root-owned + sticky."""
+    trusted_owners = {0, os.geteuid()}
+    for parent in reversed((folder, *folder.parents)):
+        try:
+            info = os.lstat(parent)
+        except FileNotFoundError:
+            fail(f"SSH key directory missing: {parent}. Select a valid key or generate a dedicated one.")
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in trusted_owners:
+            fail(f"Unsafe/untrusted SSH key directory ownership or symlink: {parent}")
+        if info.st_mode & 0o022:
+            sticky_root = (info.st_uid == 0 and
+                           info.st_mode & stat.S_ISVTX and
+                           stat.S_ISDIR(info.st_mode))
+            if not sticky_root:
+                fail(f"SSH key parent directory is writable by others: {parent}")
+
+
 def private_key_path(value: str) -> Path:
-    key = Path(value)
-    if not key.is_absolute() or re.search(r'[\s"\\\x00-\x1f]', value):
-        fail("SSH key path must be absolute without whitespace or control characters.")
-    if not key.is_file() or key.is_symlink() or any(parent.is_symlink() for parent in key.parents):
+    key = checked_key_name(value)
+    trusted_key_parents(key.parent)
+    try:
+        meta = os.lstat(key)
+    except FileNotFoundError:
+        fail(f"Identity file missing or unsafe: {key}")
+    if not stat.S_ISREG(meta.st_mode):
         fail(f"Identity file missing or unsafe (symlinks are not accepted): {key}")
-    metadata = key.stat()
-    if metadata.st_mode & 0o077 or (os.geteuid() == 0 and metadata.st_uid != 0):
+    if meta.st_mode & 0o077 or (os.geteuid() == 0 and meta.st_uid != 0):
         fail(f"Private key permissions/ownership unsafe: {key}; expected root-owned mode 0600.")
+    if meta.st_uid not in {0, os.geteuid()}:
+        fail(f"Untrusted owner of private SSH key: {key}")
     return key
+
+
+@contextlib.contextmanager
+def locked_key_directory(folder: Path):
+    """Advisory lock on the *directory inode*, not the networking-state lock."""
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        limit = time.monotonic() + 12
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= limit:
+                    fail("Another SSH key creation is running. Try again shortly.")
+                time.sleep(0.05)
+        trusted_key_parents(folder)
+        yield
+    finally:
+        os.close(fd)
 
 
 def create_dedicated_key() -> Path:
-    """Only called after explicit operator choice; never overwrite operator keys."""
+    """Generate in a private staging dir and publish via no-replace hard links."""
     require_root()
-    key = KEY_PATH
+    key = checked_key_name(str(KEY_PATH))
     pub = Path(str(key) + ".pub")
     folder = key.parent
-    if folder.is_symlink() or any(parent.is_symlink() for parent in folder.parents) or (folder.exists() and not folder.is_dir()):
-        fail(f"Unsafe SSH key directory: {folder}")
-    if folder.exists():
-        meta = folder.stat()
-        if os.geteuid() == 0 and meta.st_uid != 0:
-            fail(f"SSH key directory is not owned by root: {folder}")
-        if meta.st_mode & 0o077:
-            if not yes_no(f"Secure SSH key directory {folder} to mode 0700 before generating?", default=False):
-                fail("SSH key creation cancelled; the existing directory was not changed.")
-            folder.chmod(0o700)
-            if folder.stat().st_mode & 0o077:
-                fail(f"Could not secure SSH key directory: {folder}")
-    else:
-        folder.mkdir(mode=0o700, parents=True)
-    if any(p.exists() or p.is_symlink() for p in (key, pub)):
-        fail(f"Dedicated key already exists or is partially created: {key}. Select it or inspect the files; no overwrite.")
-    say(f"Creating a dedicated ED25519 SSH identity at {key} (no passphrase for unattended tunnel).")
-    run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key), "-C", "simple-connect"],
-        timeout=30)
-    private_key_path(str(key))
-    if pub.is_symlink() or not pub.is_file():
-        fail(f"Public key was not created: {pub}. Check the generated files before retry.")
-    say(f"New SSH key created. Private key stays ONLY on this CLIENT: {key}", "OK")
-    return key
+    # Parent must already exist and be trusted. Never create arbitrary
+    # ancestors from user-controlled path components.
+    trusted_key_parents(folder.parent)
+    # Two concurrent creators may both see an absent .ssh directory. Create
+    # idempotently, then verify ownership/mode before using or locking it.
+    folder.mkdir(mode=0o700, exist_ok=True)
+    trusted_key_parents(folder)
+    info = os.lstat(folder)
+    if info.st_mode & 0o077:
+        if not yes_no(f"Secure SSH key directory {folder} to mode 0700 before generating?", default=False):
+            fail("SSH key creation cancelled; the existing directory was not changed.")
+        folder.chmod(0o700)
+    with locked_key_directory(folder):
+        if folder.stat().st_mode & 0o077:
+            fail(f"SSH key directory remains unsafe: {folder}")
+        if any(p.exists() or p.is_symlink() for p in (key, pub)):
+            fail(f"Dedicated key already exists or is partially created: {key}. No overwrite attempted.")
+        say(f"Creating a dedicated ED25519 SSH identity at {key} (no passphrase for unattended tunnel).")
+        with tempfile.TemporaryDirectory(prefix=".sc-keygen-", dir=folder) as stage:
+            staged = Path(stage) / "identity"
+            staged_pub = Path(str(staged) + ".pub")
+            run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(staged),
+                 "-C", "simple-connect"], timeout=30)
+            private_key_path(str(staged))
+            if not staged_pub.is_file() or staged_pub.is_symlink():
+                fail("SSH key generation did not produce a valid public key.")
+            staged_pub.chmod(0o644)
+            try:
+                # Hard links fail with EEXIST even if another writer races:
+                # never use rename/replace for security-sensitive key paths.
+                os.link(staged, key, follow_symlinks=False)
+            except FileExistsError:
+                fail(f"Dedicated private key appeared during creation: {key}. No overwrite performed.")
+            try:
+                os.link(staged_pub, pub, follow_symlinks=False)
+            except BaseException as exc:
+                # Roll back only the inode linked by *this* process.
+                try:
+                    own = os.lstat(key)
+                    stage_inode = os.lstat(staged)
+                    if (own.st_dev, own.st_ino) == (stage_inode.st_dev, stage_inode.st_ino):
+                        key.unlink()
+                except FileNotFoundError:
+                    pass
+                if isinstance(exc, FileExistsError):
+                    fail(f"Another public key appeared during generation: {pub}. Nothing was overwritten; inspect the existing keypair.")
+                raise
+        private_key_path(str(key))
+        say(f"New SSH key created. Private key stays ONLY on this CLIENT: {key}", "OK")
+        return key
 
 
 def select_identity(explicit: str | None) -> str:
@@ -732,26 +816,99 @@ def select_identity(explicit: str | None) -> str:
             say("Enter another existing key path or press b to return to the menu.", "INFO")
 
 
+def single_public_record(data: bytes) -> tuple[str, str]:
+    """A single plain OpenSSH public-key line, not an authorized_keys bundle."""
+    if len(data) > 8192:
+        fail("Public key file is too large; expected exactly one SSH key record.")
+    try:
+        raw = data.decode("ascii")
+    except UnicodeDecodeError:
+        fail("Public key must contain exactly one printable ASCII SSH key record.")
+    if raw.count("\n") > 1 or "\r" in raw:
+        fail("Public key must contain exactly one line; additional keys/records are not allowed.")
+    line = raw[:-1] if raw.endswith("\n") else raw
+    if not line or any(ord(c) < 32 or ord(c) > 126 for c in line):
+        fail("Public key contains unexpected control/extra content.")
+    fields = line.split(maxsplit=2)
+    if len(fields) < 2 or not (fields[0] in ("ssh-ed25519", "ssh-rsa")
+                              or fields[0].startswith("ecdsa-sha2-")
+                              or fields[0].startswith("sk-")):
+        fail("Public key must be a plain OpenSSH public-key record.")
+    if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", fields[1]):
+        fail("Public key data has unexpected characters.")
+    try:
+        if len(base64.b64decode(fields[1], validate=True)) < 16:
+            fail("Public key data is unexpectedly short.")
+    except (ValueError, base64.binascii.Error):
+        fail("Public key data is not valid base64.")
+    return fields[0], fields[1]
+
+
+def read_public_key_record(path: Path) -> tuple[str, str]:
+    """Read one trusted public-key record from an open NOFOLLOW descriptor."""
+    trusted_key_parents(path.parent)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:  # Symlink blocked by O_NOFOLLOW.
+            fail(f"Unsafe symlinked public SSH key: {path}")
+        raise
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, os.geteuid()}
+                or info.st_mode & 0o022):
+            fail(f"Unsafe public key owner/permissions: {path}")
+        if info.st_size > 8192:
+            fail(f"Public key file is too large: {path}")
+        content = os.read(fd, 8193)
+        return single_public_record(content)
+    finally:
+        os.close(fd)
+
+
 def validated_public_key(key: Path) -> Path:
-    """Verify the public half belongs to the selected private key; never expose private bytes."""
+    """Verify the sole public key against a stable, passphrase-free private key."""
     private_key_path(str(key))
     pub = Path(str(key) + ".pub")
-    if pub.is_symlink() or (pub.exists() and not pub.is_file()):
-        fail(f"Unsafe public key path: {pub}")
-    result = run(["ssh-keygen", "-y", "-P", "", "-f", str(key)], timeout=12)
-    data = result.stdout.strip()
-    fields = data.split()
-    if len(fields) < 2 or not (fields[0] in ("ssh-ed25519", "ssh-rsa") or
-                                   fields[0].startswith("ecdsa-sha2-") or
-                                   fields[0].startswith("sk-")):
-        fail("SSH private key must be a usable passphrase-free OpenSSH identity for automatic startup.")
-    if pub.exists():
-        recorded = pub.read_text().strip().split()
-        if recorded[:2] != fields[:2]:
-            fail(f"Public key does not match selected private key: {pub}")
-    else:
-        atomic_write(pub, (data + "\n").encode(), mode=0o644)
+    before = os.lstat(key)
+    response = run(["ssh-keygen", "-y", "-P", "", "-f", str(key)], timeout=12)
+    after = os.lstat(key)
+    fingerprint = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    if fingerprint(before) != fingerprint(after):
+        fail("Private SSH key changed during validation; public-key enrollment cancelled.")
+    expected = single_public_record(response.stdout.encode("utf-8"))
+    try:
+        actual = read_public_key_record(pub)
+    except FileNotFoundError:
+        # No atomic_write here: it could overwrite a public key published
+        # by another process between the existence check and final save.
+        try:
+            fd = os.open(pub, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        except FileExistsError:
+            fail(f"Public SSH key appeared during validation: {pub}; retry without overwriting.")
+        created = os.fstat(fd)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                os.fchmod(handle.fileno(), 0o644)
+                handle.write((" ".join(expected) + "\n").encode("ascii"))
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            # Remove only the inode we exclusively created. Never unlink a
+            # key that another operator replaced in the meantime.
+            try:
+                current = os.lstat(pub)
+                if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+                    pub.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        actual = read_public_key_record(pub)
         say(f"Recovered matching public key: {pub}", "OK")
+    if actual != expected:
+        fail(f"Public key does not match selected private key: {pub}")
+    if fingerprint(os.lstat(key)) != fingerprint(after):
+        fail("Private SSH key changed during public-key validation; retry safely.")
     return pub
 
 
@@ -770,7 +927,12 @@ def enroll_public_key() -> None:
     helper = Path("/usr/bin/ssh-copy-id")
     if not helper.is_file() or helper.is_symlink():
         fail("ssh-copy-id unavailable. Install the Debian openssh-client package before enrolling.")
+    if "$" in cfg["ssh_user"]:
+        fail("Public-key enrollment helper rejects dollar signs in SSH usernames; use a different account or the trusted remote console.")
     pub = validated_public_key(Path(cfg["identity_file"]))
+    # Re-open with O_NOFOLLOW immediately before handing this trusted,
+    # strictly one-line public key to the shell-based ssh-copy-id helper.
+    read_public_key_record(pub)
     target = f"{cfg['ssh_user']}@{cfg['remote_ip']}"
     say(f"Install ONLY the public key on {target}:{cfg['ssh_port']}.", "INFO")
     say("Remote SSH may request its existing account password in this terminal; it is NOT stored.", "WARN")
@@ -780,7 +942,8 @@ def enroll_public_key() -> None:
            target]
     try:
         result = subprocess.run(cmd, timeout=180, check=False,
-                                env={**os.environ, "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"})
+                                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root",
+                                     "TERM": os.environ.get("TERM", "dumb")})
     except subprocess.TimeoutExpired:
         fail("Public-key enrollment timed out. Confirm SSH port, credentials and remote login policy.")
     if result.returncode:
@@ -798,6 +961,26 @@ def display_public_key() -> None:
     print(pub.read_text().strip())
 
 
+def ssh_configuration_snapshot() -> tuple[bytes | None, ...]:
+    """Stable contents of all three owned SSH configuration files under lock."""
+    fingerprints = []
+    for path in (CONF, SSH_CONF, KNOWN_HOSTS):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            fingerprints.append(None)
+            continue
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+                fail(f"Unsafe SSH configuration file: {path}")
+            raw = os.read(fd, 65537)
+            fingerprints.append(hashlib.sha256(raw).digest())
+        finally:
+            os.close(fd)
+    return tuple(fingerprints)
+
+
 def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
               identity_file: str | None, fingerprint: str | None) -> None:
     require_root()
@@ -806,6 +989,7 @@ def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
     with locked(wait_seconds=6):
         if not service_terminated() or read_json(STATE).get("status") != "DIRECT" or any_proxy_tables():
             fail("Switch OFF and complete recovery before changing the SSH endpoint.")
+        prior_ssh = ssh_configuration_snapshot()
     interactive = (sys.stdin.isatty() and
                    any(x is None for x in (remote_ip, ssh_user, ssh_port, identity_file, fingerprint)))
     if interactive:
@@ -866,6 +1050,8 @@ def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
         require_no_teardown()
         if not service_terminated() or read_json(STATE).get("status") != "DIRECT" or any_proxy_tables():
             fail("Network state changed during SSH setup; no configuration saved.")
+        if ssh_configuration_snapshot() != prior_ssh:
+            fail("SSH configuration changed during setup by another session. No changes saved; restart Configure SSH.")
         ETC.mkdir(parents=True, exist_ok=True)
         atomic_write(KNOWN_HOSTS, (keys[0] + "\n").encode())
         atomic_write(SSH_CONF, sshcfg.encode())
@@ -1789,7 +1975,7 @@ def uninstall(yes: bool) -> None:
 
 
 def clear_menu() -> None:
-    if (sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    if (sys.stdout.isatty()
             and os.environ.get("TERM", "") not in ("", "dumb")):
         print("\033[2J\033[H", end="", flush=True)
 

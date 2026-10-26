@@ -89,7 +89,8 @@ class CliOnboardingTests(unittest.TestCase):
             with self.assertRaisesRegex(sc.ConnectError, "symlink"):
                 sc.private_key_path(str(aliased_parent / "dedicated"))
             pub = Path(str(key) + ".pub")
-            pub.write_text("ssh-ed25519 AAAABADKEY do-not-trust\n")
+            other = self.make_key(root, "different")
+            pub.write_bytes(Path(str(other) + ".pub").read_bytes())
             with self.assertRaisesRegex(sc.ConnectError, "does not match"):
                 sc.validated_public_key(key)
 
@@ -221,9 +222,9 @@ class CliOnboardingTests(unittest.TestCase):
             root = Path(d)
             known = root / "known_hosts"
             known.write_text("[8.8.8.8]:56777 ssh-ed25519 AAAAKEY\n")
-            pub = root / "key.pub"
-            pub.write_text("ssh-ed25519 AAAAKEY\n")
-            cfg = {"identity_file": str(root / "key"), "ssh_user": "root",
+            key = self.make_key(root, "key")
+            pub = Path(str(key) + ".pub")
+            cfg = {"identity_file": str(key), "ssh_user": "root",
                    "ssh_port": 56777, "remote_ip": "8.8.8.8"}
             with patch.object(sc, "KNOWN_HOSTS", known), (
                  patch.object(sc, "require_root")), (
@@ -319,7 +320,7 @@ class CliOnboardingTests(unittest.TestCase):
              patch.object(sc.sys, "stdout", TerminalBuffer())) as tty:
             self.assertEqual(sc.paint("READY", "good"), "READY")
             sc.clear_menu()
-            self.assertNotIn("\033", tty.getvalue())
+            self.assertIn("\033[2J", tty.getvalue())  # Clearing is independent of NO_COLOR.
         with patch.dict(os.environ, {"TERM": "xterm"}, clear=True), (
              contextlib.redirect_stdout(io.StringIO())) as plain:
             self.assertEqual(sc.paint("READY", "good"), "READY")
