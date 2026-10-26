@@ -80,6 +80,9 @@ HOST_KEY_ALGORITHMS = {
 }
 HOST_KEY_ORDER = tuple(HOST_KEY_ALGORITHMS)
 SSH_HOST_DIR = Path("/etc/ssh")
+# Never execute an sshd discovered through a potentially user-controlled PATH
+# while displaying root-only server diagnostics.
+SSH_DAEMON = Path("/usr/sbin/sshd")
 COLORS = {
     "title": "\033[1;34m", "heading": "\033[1;36m",
     "good": "\033[1;32m", "warn": "\033[1;33m",
@@ -1898,7 +1901,18 @@ def server_host_report(*, probe: bool = False) -> dict:
         report["active"] = is_active("ssh.service") or is_active("sshd.service")
     except (ConnectError, OSError, subprocess.TimeoutExpired) as exc:
         report["notes"].append(f"SSH service state unknown: {exc}")
-    daemon = shutil.which("sshd")
+    daemon = None
+    try:
+        daemon_stat = os.lstat(SSH_DAEMON)
+        if (stat.S_ISREG(daemon_stat.st_mode) and daemon_stat.st_uid == 0
+                and not daemon_stat.st_mode & 0o022):
+            daemon = str(SSH_DAEMON)
+        else:
+            report["notes"].append(f"Unsafe sshd executable identity or permissions: {SSH_DAEMON}")
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        report["notes"].append(f"Could not inspect sshd executable: {exc}")
     config = {}
     if daemon:
         try:
@@ -1914,7 +1928,7 @@ def server_host_report(*, probe: bool = False) -> dict:
         except (ConnectError, OSError) as exc:
             report["notes"].append(f"Unable to inspect effective sshd settings: {exc}")
     else:
-        report["notes"].append("sshd unavailable: effective SSH configuration cannot be inspected.")
+        report["notes"].append("Trusted /usr/sbin/sshd unavailable: effective SSH configuration cannot be inspected.")
 
     ports = []
     for item in config.get("port", []):

@@ -1,8 +1,11 @@
 """Multi-algorithm SSH host identity and server-side read-only UI tests."""
 import contextlib
 import io
+import os
 from pathlib import Path
 import re
+import stat
+from types import SimpleNamespace
 import subprocess
 import sys
 import tempfile
@@ -14,6 +17,20 @@ import simple_connect as sc
 
 
 class HostKeyTests(unittest.TestCase):
+    def setUp(self):
+        # CI runners need not have openssh-server installed. Only the one
+        # canonical daemon's file identity is simulated; all host-key files
+        # and ssh-keygen checks are real. Untrusted custom sshd paths remain
+        # subject to their actual lstat metadata.
+        original = os.lstat
+        def controlled_lstat(path, *args, **kwargs):
+            if os.fspath(path) == "/usr/sbin/sshd":
+                return SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0)
+            return original(path, *args, **kwargs)
+        mocked = patch.object(sc.os, "lstat", side_effect=controlled_lstat)
+        mocked.start()
+        self.addCleanup(mocked.stop)
+
     def key(self, folder, name, kind, bits=None):
         path = folder / name
         args = ["ssh-keygen", "-q", "-t", kind, "-N", "", "-f", str(path)]
@@ -427,6 +444,46 @@ class HostKeyTests(unittest.TestCase):
             self.assertEqual(report["keys"][0]["private"],"PUBLIC/PRIVATE KEY MISMATCH")
             self.assertFalse(report["keys"][0]["enabled"])
             self.assertIn("NOT READY", report["keys"][0]["status"])
+
+    def test_sshd_diagnostics_do_not_execute_path_hijack(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder=Path(d)
+            (folder/"sshd").write_text("#!/bin/sh\nexit 99\n")
+            (folder/"sshd").chmod(0o755)
+            calls=[]
+            actual=sc.run
+            def fake(argv, **kwargs):
+                calls.append(argv)
+                if argv[0] == "/usr/sbin/sshd":
+                    return subprocess.CompletedProcess(argv,0,
+                        "port 23456\nhostkeyalgorithms ssh-ed25519\n","")
+                return actual(argv,**kwargs)
+            with patch.dict(os.environ,{"PATH":str(folder)+":/usr/bin"},clear=False), (
+                 patch.object(sc.shutil,"which",return_value=str(folder/"sshd"))), (
+                 patch.object(sc,"SSH_HOST_DIR",folder)), (
+                 patch.object(sc,"is_active",return_value=False)), (
+                 patch.object(sc,"run",side_effect=fake)):
+                result=sc.server_host_report(probe=False)
+            self.assertTrue(any(call[0]=="/usr/sbin/sshd" for call in calls))
+            self.assertFalse(any(call[0]==str(folder/"sshd") for call in calls))
+            self.assertEqual(result["ports"],[23456])
+
+    def test_invalid_daemon_path_is_not_executed(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder=Path(d)
+            file=folder/"sshd"
+            file.write_text("#!/bin/sh\nexit 99\n")
+            file.chmod(0o777)
+            with (
+                patch.object(sc, "SSH_DAEMON", file),
+                patch.object(sc, "SSH_HOST_DIR", folder),
+                patch.object(sc, "is_active", return_value=False),
+                patch.object(sc, "run") as execute,
+            ):
+                report=sc.server_host_report(probe=False)
+            execute.assert_not_called()
+            self.assertFalse(report["configured"])
+            self.assertIn("Unsafe sshd executable", " ".join(report["notes"]))
 
 
 if __name__ == "__main__":
