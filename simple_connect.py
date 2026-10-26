@@ -140,14 +140,19 @@ def read_json(path: Path, default: dict | None = None) -> dict:
 
 
 @contextlib.contextmanager
-def locked():
+def locked(wait_seconds: float = 0):
     LOCK.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            fail("Another Simple Connect operation is running. Try again shortly.")
+        until = time.monotonic() + wait_seconds
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= until:
+                    fail("Another Simple Connect operation is running. Try again shortly.")
+                time.sleep(0.1)
         yield
     finally:
         os.close(fd)
@@ -202,6 +207,24 @@ def banner() -> None:
     print("  SSH-based outbound IPv4 TCP / DNS  |  default DIRECT\n")
 
 
+def require_supported_python() -> None:
+    if not ((3, 10) <= sys.version_info[:2] < (4, 0)):
+        fail("Python >=3.10 and <4.0 is required by official sshuttle 2.0.0.")
+    proc = subprocess.run(
+        ["/usr/bin/python3", "-c",
+         "import sys; assert (3, 10) <= sys.version_info[:2] < (4, 0)"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if proc.returncode != 0:
+        fail("System /usr/bin/python3 must be >=3.10 and <4.0.")
+
+
+def require_client_role() -> None:
+    role = ETC / "role"
+    if not role.is_file() or role.is_symlink() or role.read_text().strip() != "client":
+        fail("This action requires a configured CLIENT role; SERVER role is SSH-only.")
+
+
 def install_requirements(role: str) -> None:
     if not Path("/etc/os-release").exists():
         fail("Only apt-based Linux hosts are supported at present.")
@@ -209,7 +232,7 @@ def install_requirements(role: str) -> None:
     if role == "server":
         needed["sshd"] = "openssh-server"
     else:
-        needed.update({"ssh": "openssh-client", "nft": "nftables", "curl": "curl"})
+        needed.update({"ssh": "openssh-client", "nft": "nftables", "curl": "curl", "ip": "iproute2"})
     missing = sorted({pkg for exe, pkg in needed.items() if shutil.which(exe) is None})
     if missing:
         if shutil.which("apt-get") is None:
@@ -217,8 +240,7 @@ def install_requirements(role: str) -> None:
         say(f"Installing missing packages ONLY: {', '.join(missing)}")
         run(["apt-get", "update"], timeout=150, capture=False)
         run(["apt-get", "install", "-y", "--no-install-recommends", *missing], timeout=240, capture=False)
-    if sys.version_info < (3, 9):
-        fail("Python >=3.9 is required; the system Python is too old.")
+    require_supported_python()
     say("Prerequisites already present or installed. No system-wide upgrade.", "OK")
 
 
@@ -364,12 +386,24 @@ WantedBy=timers.target
 
 def setup(role: str, wheel_url: str) -> None:
     require_root()
-    if is_active(SERVICE):
-        fail("Stop and recover the active proxy before running setup or updating files.")
-    install_requirements(role)
     role_path = ETC / "role"
-    if role_path.is_file() and role_path.read_text().strip() != role:
-        fail(f"Host already configured as {role_path.read_text().strip()}; switch roles only after cleanup.")
+    if role_path.exists():
+        if role_path.is_symlink() or not role_path.is_file():
+            fail("Unsafe role file; refusing setup.")
+        current_role = role_path.read_text().strip()
+        if current_role != role:
+            fail(f"Host already configured as {current_role}; switch roles only after cleanup.")
+        if current_role == "client":
+            if not STATE.is_file() or STATE.is_symlink():
+                fail("Existing CLIENT state is missing/unsafe. Recovery required before setup.")
+            old = read_json(STATE)
+            if old.get("status") != "DIRECT" or not service_terminated() or any_proxy_tables():
+                fail("Recovery unresolved, service may be running or nft table remains: refuse setup/update.")
+        elif CONF.exists() or STATE.exists() or is_active(SERVICE):
+            fail("Unexpected CLIENT resources on SERVER role; use documented recovery before setup.")
+    elif STATE.exists() or CONF.exists() or is_active(SERVICE):
+        fail("Orphan CLIENT state/service exists; refuse to replace recovery assets.")
+    install_requirements(role)
     install_entrypoint()
     ETC.mkdir(mode=0o700, parents=True, exist_ok=True)
     atomic_write(role_path, (role + "\n").encode())
@@ -415,8 +449,9 @@ def ask(value: str | None, label: str, default: str | None = None) -> str:
 def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
               identity_file: str | None, fingerprint: str | None) -> None:
     require_root()
-    if is_active(SERVICE):
-        fail("Switch OFF before changing the SSH endpoint.")
+    require_client_role()
+    if not service_terminated() or read_json(STATE).get("status") != "DIRECT" or any_proxy_tables():
+        fail("Switch OFF and complete recovery before changing the SSH endpoint.")
     remote_ip = ask(remote_ip, "Remote public IPv4")
     ssh_user = ask(ssh_user, "SSH username", "root")
     try:
@@ -471,21 +506,90 @@ def read_config() -> dict:
 
 def remote_python_test() -> None:
     p = run(["ssh", "-F", str(SSH_CONF), "sc-remote",
-             'python3 -c "import sys; assert sys.version_info >= (3, 9)"'],
+             'python3 -c "import sys; assert (3, 10) <= sys.version_info[:2] < (4, 0)"'],
             timeout=25)
-    say("Authenticated SSH and remote Python >=3.9 verified.", "OK")
+    say("Authenticated SSH and remote Python >=3.10,<4.0 verified.", "OK")
 
 
-def initial_ssh_connection() -> str:
-    value = os.getenv("SSH_CONNECTION", "").strip()
-    parts = value.split()
-    if len(parts) != 4:
-        fail("Run ON from an authenticated SSH terminal (SSH_CONNECTION missing).")
-    validate_ipv4(parts[0])
-    if not all(p.isdigit() and 0 < int(p) <= 65535 for p in (parts[1], parts[3])):
-        fail("SSH_CONNECTION contains invalid ports.")
-    validate_ipv4(parts[2])
-    return " ".join(parts)
+def parse_proc_tcp_line(line: str, *, ipv6: bool = False) -> tuple[str, int, str, int, int] | None:
+    """Linux /proc/net/tcp{,6} ESTABLISHED socket tuple and kernel inode."""
+    parts = line.split()
+    if len(parts) < 10 or parts[3] != "01":
+        return None
+    try:
+        local_hex, local_port = parts[1].split(":")
+        remote_hex, remote_port = parts[2].split(":")
+        def decode(raw: str) -> str:
+            if ipv6:
+                packed = b"".join(bytes.fromhex(raw[i:i + 8])[::-1] for i in range(0, 32, 8))
+                addr = ipaddress.IPv6Address(packed)
+                if addr.ipv4_mapped is None:
+                    raise ValueError("IPv6 SSH management is not yet supported")
+                return str(addr.ipv4_mapped)
+            return str(ipaddress.IPv4Address(bytes.fromhex(raw)[::-1]))
+        local = decode(local_hex)
+        remote = decode(remote_hex)
+        return (remote, int(remote_port, 16), local, int(local_port, 16), int(parts[9]))
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
+def initial_ssh_connection(*, proc_root: Path = Path('/proc'), pid: int | None = None) -> str:
+    """Prove the caller descends from a real sshd TCP session.
+
+    NEVER trust SSH_CONNECTION (which can be edited by any local process).
+    Only the kernel socket inode of an ancestor sshd/sshd-session process
+    paired with an established kernel TCP connection is accepted.
+    The TCP inode additionally differentiates repeated logins with a
+    reused 4-tuple and cannot be forged by environment-only changes.
+    """
+    pid = os.getpid() if pid is None else pid
+    ssh_sockets: set[int] = set()
+    seen: set[int] = set()
+    for _ in range(64):
+        if pid <= 1 or pid in seen:
+            break
+        seen.add(pid)
+        proc = proc_root / str(pid)
+        try:
+            status = (proc / "status").read_text()
+            m = re.search(r"(?m)^PPid:\s*(\d+)$", status)
+            if m is None:
+                fail("Cannot verify the invoking process ancestry.")
+            parent = int(m.group(1))
+            executable = Path(os.readlink(proc / "exe")).name
+            if executable in ("sshd", "sshd-session"):
+                for f in (proc / "fd").iterdir():
+                    try:
+                        target = os.readlink(f)
+                    except (OSError, PermissionError):
+                        continue
+                    match = re.fullmatch(r"socket:\[(\d+)\]", target)
+                    if match:
+                        ssh_sockets.add(int(match.group(1)))
+            pid = parent
+        except (OSError, PermissionError) as exc:
+            fail(f"Cannot verify authenticated SSH parent process: {exc}")
+    if not ssh_sockets:
+        fail("Authenticated SSH process ancestry/socket absent; run from a real SSH login.")
+
+    matches: set[tuple[str, int, str, int, int]] = set()
+    for filename, is_v6 in (("tcp", False), ("tcp6", True)):
+        try:
+            lines = (proc_root / "net" / filename).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parsed = parse_proc_tcp_line(line, ipv6=is_v6)
+            if parsed and parsed[4] in ssh_sockets:
+                matches.add(parsed)
+    if len(matches) != 1:
+        fail("Could not uniquely verify an ESTABLISHED authenticated SSH TCP socket.")
+    peer_ip, peer_port, host_ip, host_port, inode = matches.pop()
+    if peer_port == 0 or host_port == 0:
+        fail("SSH socket has invalid endpoint ports.")
+    return f"{peer_ip} {peer_port} {host_ip} {host_port} {inode}"
+
 
 
 def boot_id() -> str:
@@ -548,126 +652,34 @@ def table_is_ours(table: dict, expected: str) -> bool:
     return bool(expected) and table_hash(table) == expected
 
 
+def any_proxy_tables() -> bool:
+    """Never adopt an untracked prior sshuttle table with a different port."""
+    if shutil.which("nft") is None:
+        fail("nft command missing; unable to establish firewall safety.")
+    proc = run(["nft", "-j", "list", "tables"], timeout=10)
+    try:
+        items = json.loads(proc.stdout)["nftables"]
+        if not isinstance(items, list):
+            raise ValueError()
+        for entry in items:
+            t = entry.get("table", {}) if isinstance(entry, dict) else {}
+            if t.get("family") == "inet" and re.fullmatch(r"sshuttle-ipv4-[0-9]+", str(t.get("name", ""))):
+                return True
+        return False
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        fail("Cannot enumerate nftables safely; refuse operation.")
+
+
 def ensure_stopped() -> None:
-    if is_active(SERVICE):
-        fail("Cannot proceed while the proxy is already running.")
-    if current_table() is not None:
-        fail(f"Existing nftables table '{TABLE}' detected: refuse to adopt/overwrite it.")
-    state = read_json(STATE, {"status": "DIRECT"})
+    require_client_role()
+    if not service_terminated():
+        fail("Cannot proceed while the proxy is still active or stopping.")
+    state = read_json(STATE)
     if state.get("status") != "DIRECT":
         fail(f"State is {state.get('status', 'UNKNOWN')}. Run off/recover before ON.")
+    if any_proxy_tables():
+        fail("Existing/untracked sshuttle nftables table detected; refuse activation.")
 
-
-def safe_early_sshuttle_table(table: dict, state: dict) -> bool:
-    """Recognize only the complete, unmodified sshuttle 2.0.0 nft footprint.
-
-    If the daemon crashes between rule installation and the durable table
-    fingerprint, an exact shape permits narrow rollback. Earlier incomplete
-    setup without an installed redirect stays UNCERTAIN, not an unsafe flush.
-    """
-    if state.get("status") not in ("PENDING", "STOPPING") or state.get("boot") != boot_id():
-        return False
-    if state.get("table_sha256"):
-        return False
-    name = proxy_table(state)
-    port = proxy_port(state)
-    data = table.get("nftables")
-    if not isinstance(data, list) or not data or len(data) > 80:
-        return False
-    allowed = {str(ipaddress.ip_network(x, strict=False)) for x in EXCLUDED}
-    for ip in (state.get("remote_ip"), state.get("management_ip"), "127.0.0.1"):
-        try:
-            allowed.add(str(ipaddress.ip_network(str(ip) + "/32", strict=False)))
-        except ValueError:
-            return False
-    chains = set()
-    jumps = set()
-    table_count = 0
-    found = {"proto": False, "fib": False, "tcp": False}
-    def ip_match(value):
-        try:
-            if isinstance(value, dict):
-                p = value["prefix"]
-                return str(ipaddress.ip_network(f'{p["addr"]}/{p["len"]}', strict=False))
-            return str(ipaddress.ip_network(str(value) + "/32", strict=False))
-        except (KeyError, TypeError, ValueError):
-            return None
-    for item in data:
-        if not isinstance(item, dict) or len(item) != 1:
-            return False
-        kind, entry = next(iter(item.items()))
-        if kind == "metainfo":
-            continue
-        if not isinstance(entry, dict) or entry.get("family") != "inet":
-            return False
-        if kind == "table" and entry.get("name") != name:
-            return False
-        if kind not in ("table", "metainfo") and entry.get("table") != name:
-            return False
-        if kind == "table":
-            if set(entry) != {"family", "name", "handle"} or not isinstance(entry["handle"], int):
-                return False
-            table_count += 1
-            continue
-        if kind == "chain":
-            if not isinstance(entry.get("handle"), int):
-                return False
-            ch = entry.get("name")
-            if ch in ("output", "prerouting"):
-                if set(entry) != {"family", "table", "name", "handle", "type", "hook", "prio", "policy"}:
-                    return False
-                if (entry["type"], entry["hook"], entry["prio"], entry["policy"]) != ("nat", ch, -100, "accept"):
-                    return False
-            elif ch == name:
-                if set(entry) != {"family", "table", "name", "handle"}:
-                    return False
-            else:
-                return False
-            chains.add(ch)
-            continue
-        if kind != "rule" or set(entry) != {"family", "table", "chain", "handle", "expr"}:
-            return False
-        if not isinstance(entry["handle"], int) or not isinstance(entry["expr"], list):
-            return False
-        ch = entry["chain"]
-        expr = entry["expr"]
-        if any(not isinstance(element, dict) for element in expr):
-            return False
-        if ch in ("output", "prerouting"):
-            if expr != [{"jump": {"target": name}}]:
-                return False
-            jumps.add(ch)
-            continue
-        if ch != name:
-            return False
-        if expr == [{"match": {"op": "!=", "left": {"meta": {"key": "nfproto"}}, "right": "ipv4"}}, {"return": None}]:
-            found["proto"] = True
-        elif expr == [{"match": {"op": "==", "left": {"fib": {"result": "type", "flags": ["daddr"]}}, "right": "local"}}, {"return": None}]:
-            found["fib"] = True
-        elif len(expr) == 3 and expr[0] == {"match": {"op": "==", "left": {"meta": {"key": "l4proto"}}, "right": "tcp"}} and expr[1].get("match", {}).get("left") == {"payload": {"protocol": "ip", "field": "daddr"}}:
-            address = ip_match(expr[1]["match"].get("right"))
-            if expr[1]["match"].get("op") != "==":
-                return False
-            if expr[2] == {"return": None} and address in allowed:
-                pass
-            elif expr[2] == {"redirect": {"port": port}} and address == "0.0.0.0/0":
-                found["tcp"] = True
-            else:
-                return False
-        elif len(expr) == 3 and expr[0].get("match", {}).get("left") == {"payload": {"protocol": "ip", "field": "daddr"}} and expr[1] == {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 53}}:
-            target = expr[0]["match"].get("right")
-            redirect = expr[2].get("redirect", {})
-            if expr[0]["match"].get("op") != "==" or not isinstance(target, str) or not isinstance(redirect, dict):
-                return False
-            try:
-                ipaddress.IPv4Address(target)
-            except ValueError:
-                return False
-            if set(redirect) != {"port"} or type(redirect["port"]) is not int or not (9000 <= redirect["port"] <= 12300):
-                return False
-        else:
-            return False
-    return table_count == 1 and chains == {"output", "prerouting", name} and jumps == {"output", "prerouting"} and all(found.values())
 
 
 def owned_cleanup(state: dict) -> bool:
@@ -675,27 +687,154 @@ def owned_cleanup(state: dict) -> bool:
     if table is None:
         return True
     expected = state.get("table_sha256", "")
-    if not isinstance(expected, str) or not (
-        table_is_ours(table, expected) or (not expected and safe_early_sshuttle_table(table, state))
-    ):
+    # A table cannot be claimed by its name or plausible shape. During the
+    # activation gap BEFORE a full fingerprint has been durably recorded,
+    # report UNCERTAIN instead of deleting a possibly foreign-modified table.
+    if not isinstance(expected, str) or not table_is_ours(table, expected):
         say(f"UNCERTAIN: nftables table {proxy_table(state)} differs from recorded owned state. Manual inspection needed.", "ERROR")
         return False
     run(["nft", "delete", "table", "inet", proxy_table(state)], timeout=10)
     return current_table(state) is None
 
 
-def reconcile(reason: str) -> None:
+def service_terminated() -> bool:
+    """Conservative systemd proof; inactive alone is insufficient.
+
+    ExecStopPost runs while the unit is 'deactivating' and the control PID
+    is the recovery process itself. Only allow that special systemd state
+    when the main PID is already zero and our own PID is the control PID.
+    """
+    proc = run(
+        ["systemctl", "show", SERVICE, "--no-pager",
+         "--property=ActiveState,MainPID,ControlPID,LoadState"],
+        timeout=10,
+    )
+    data = dict(
+        line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line
+    )
+    try:
+        main_pid = int(data["MainPID"])
+        control_pid = int(data["ControlPID"])
+        active = data["ActiveState"]
+    except (KeyError, ValueError):
+        fail("Cannot verify proxy process termination through systemd.")
+    if main_pid != 0:
+        return False
+    if active in ("inactive", "failed"):
+        return control_pid == 0
+    return active == "deactivating" and control_pid == os.getpid()
+
+
+def mark_uncertain(reason: str) -> None:
     state = read_json(STATE, {"status": "DIRECT"})
-    if owned_cleanup(state):
-        write_json(STATE, {"status": "DIRECT", "last_recovery": reason})
-        say(f"Direct networking restored/verified for owned nftables table ({reason}).", "OK")
-    else:
-        write_json(STATE, {**state, "status": "UNCERTAIN", "last_recovery": reason})
-        fail("Partial rollback: non-owned or changed rules may exist. Use provider console; no blind flush.")
+    write_json(STATE, {**state, "status": "UNCERTAIN", "last_recovery": reason})
+
+
+def reconcile(reason: str) -> None:
+    # Do NOT delete any nftables table, or claim DIRECT, while a live
+    # sshuttle process may be manipulating/recreating the redirection.
+    if not service_terminated():
+        mark_uncertain("proxy_not_confirmed_stopped:" + reason)
+        fail("Proxy process termination NOT verified; state UNCERTAIN, firewall untouched.")
+    state = read_json(STATE, {"status": "DIRECT"})
+    if not owned_cleanup(state):
+        mark_uncertain("firewall_ownership_uncertain:" + reason)
+        fail("Partial rollback: unknown or changed nftables table preserved; provider-console recovery required.")
+    # A stale table from a different listener port is still capable of
+    # redirecting host traffic. Do not claim DIRECT merely because the
+    # last recorded listener's table is absent.
+    if any_proxy_tables() or not service_terminated():
+        mark_uncertain("untracked_table_or_live_proxy:" + reason)
+        fail("Cannot prove DIRECT: untracked sshuttle table or running proxy; UNCERTAIN.")
+    write_json(STATE, {"status": "DIRECT", "last_recovery": reason})
+    say(f"Direct networking restored/verified for owned nftables table ({reason}).", "OK")
+
+
+def stop_and_recover(reason: str) -> None:
+    # Do not hold the manager lock over systemctl stop: ExecStopPost takes it.
+    if not service_terminated():
+        try:
+            stop = run(["systemctl", "stop", SERVICE], check=False, timeout=40)
+        except (ConnectError, OSError, subprocess.TimeoutExpired) as exc:
+            with locked():
+                mark_uncertain("systemd_stop_error:" + reason)
+            fail(f"Unable to stop proxy safely: {exc}. State UNCERTAIN.")
+        if stop.returncode != 0 or not service_terminated():
+            with locked():
+                mark_uncertain("systemd_stop_unverified:" + reason)
+            fail("Proxy stop did not complete successfully; state UNCERTAIN, no firewall deletion.")
+    # ExecStopPost may have already completed recovery. Reconcile remains
+    # idempotent but strictly checks service termination again.
+    recover(reason)
+
+
+def effective_exclusions(remote_ip: str, management_ip: str) -> list[str]:
+    """Keep directly connected PUBLIC subnets and on-link gateways direct.
+
+    Local address-only nft FIB checks do NOT exclude neighboring public-IP
+    hosts in the same L2 subnet. Never infer on-link routes from RFC1918.
+    """
+    routes = run(["ip", "-j", "-4", "route", "show", "table", "all"], timeout=12)
+    try:
+        entries = json.loads(routes.stdout)
+    except json.JSONDecodeError:
+        fail("Cannot read IPv4 routing configuration; refusing proxy activation.")
+    if not isinstance(entries, list) or not entries:
+        fail("No parsable IPv4 routes; cannot protect on-link network paths.")
+
+    exclusions = {str(ipaddress.IPv4Network(x)) for x in EXCLUDED}
+    exclusions.add(str(ipaddress.IPv4Network(remote_ip + "/32")))
+    exclusions.add(str(ipaddress.IPv4Network(management_ip + "/32")))
+    for entry in entries:
+        if not isinstance(entry, dict):
+            fail("Malformed IPv4 route; refusing activation.")
+        gateway = entry.get("gateway")
+        if gateway is not None:
+            try:
+                exclusions.add(str(ipaddress.IPv4Network(validate_ipv4(str(gateway)) + "/32")))
+            except (ValueError, TypeError):
+                fail("Invalid route gateway; refusing activation.")
+        scope = entry.get("scope")
+        if scope != "link" or not entry.get("dev"):
+            continue
+        dst = str(entry.get("dst", "default"))
+        if dst == "default" or dst == "0.0.0.0/0":
+            fail("An un-gatewayed on-link IPv4 default route cannot be safely intercepted.")
+        try:
+            network = ipaddress.IPv4Network(dst, strict=False)
+        except ValueError:
+            fail("Malformed directly connected subnet; refusing activation.")
+        exclusions.add(str(network))
+    if len(exclusions) > 128:
+        fail("Unusually many local routes; refusing unchecked firewall rules.")
+    return sorted(exclusions, key=lambda x: (int(ipaddress.IPv4Network(x).network_address),
+                                            ipaddress.IPv4Network(x).prefixlen))
+
+
+def stored_exclusions(state: dict) -> list[str]:
+    items = state.get("exclusions")
+    if not isinstance(items, list) or len(items) > 128 or len(items) < len(EXCLUDED) + 1:
+        fail("Missing/invalid pinned network exclusions; refusing activation.")
+    if any(not isinstance(x, str) for x in items) or len(items) != len(set(items)):
+        fail("Duplicate/invalid pinned network exclusions.")
+    try:
+        canonical = {str(ipaddress.IPv4Network(x, strict=True)) for x in items}
+    except ValueError:
+        fail("Malformed pinned network exclusion.")
+    required = {str(ipaddress.IPv4Network(x)) for x in EXCLUDED}
+    for ip in (state.get("remote_ip"), state.get("management_ip")):
+        try:
+            required.add(str(ipaddress.IPv4Network(str(ip) + "/32")))
+        except ValueError:
+            fail("Invalid management/remote IP in pinned exclusions.")
+    if not required.issubset(canonical):
+        fail("Pinned exclusions omit remote SSH endpoint or management networks.")
+    return items
 
 
 def start_proxy() -> None:
     require_root()
+    require_client_role()
     with locked():
         cfg = read_config()
         if not is_active(GUARD_TIMER):
@@ -703,13 +842,15 @@ def start_proxy() -> None:
         ensure_stopped()
         ssh_conn = initial_ssh_connection()
         remote_python_test()
+        excludes = effective_exclusions(cfg["remote_ip"], ssh_conn.split()[0])
         op = secrets.token_hex(8)
         port = choose_port()
         state = {
             "status": "PENDING", "op": op, "boot": boot_id(),
             "started": int(time.time()), "deadline": int(time.time()) + 600,
             "original_ssh_connection": ssh_conn, "management_ip": ssh_conn.split()[0],
-            "remote_ip": cfg["remote_ip"], "listen_port": port, "table_sha256": "",
+            "remote_ip": cfg["remote_ip"], "listen_port": port,
+            "exclusions": excludes, "table_sha256": "",
         }
         write_json(STATE, state)
     # Never hold the manager lock during systemd's start/stop transactions.
@@ -717,7 +858,7 @@ def start_proxy() -> None:
     try:
         unit_action("start", SERVICE)
         deadline = time.monotonic() + 8
-        while time.monotonic() < deadline and current_table() is None and is_active(SERVICE):
+        while time.monotonic() < deadline and current_table(state) is None and is_active(SERVICE):
             time.sleep(0.2)
         with locked():
             observed = read_json(STATE)
@@ -725,16 +866,15 @@ def start_proxy() -> None:
                 fail("Activation changed concurrently; refusing to commit firewall identity.")
             if not is_active(SERVICE):
                 fail("sshuttle service did not enter ACTIVE state.")
-            table = current_table()
+            table = current_table(observed)
             if table is None:
                 fail("No expected nftables table after sshuttle startup.")
             observed["table_sha256"] = table_hash(table)
             write_json(STATE, observed)
     except Exception:
-        subprocess.run(["systemctl", "stop", SERVICE], timeout=30, check=False)
-        with locked():
-            if read_json(STATE, {"status": "DIRECT"}).get("status") != "DIRECT":
-                reconcile("failed_activation")
+        # Preserve the actual stop/recovery error rather than silently
+        # overriding it with the earlier activation failure.
+        stop_and_recover("failed_activation")
         raise
     say(f"Proxy started in PENDING state; automatic rollback deadline ~10 minutes. Operation: {op}", "WARN")
     say(f"From a NEW authenticated SSH session, run: sudo simple-connect confirm {op}")
@@ -742,6 +882,7 @@ def start_proxy() -> None:
 
 def confirm(op: str) -> None:
     require_root()
+    require_client_role()
     with locked():
         state = read_json(STATE)
         if state.get("status") != "PENDING" or not secrets.compare_digest(str(state.get("op", "")), op):
@@ -753,7 +894,7 @@ def confirm(op: str) -> None:
             fail("Confirmation MUST come from a fresh independent SSH session.")
         if not is_active(SERVICE):
             fail("Proxy process is not active.")
-        table = current_table()
+        table = current_table(state)
         if table is None or not table_is_ours(table, str(state.get("table_sha256", ""))):
             fail("Firewall state changed or is missing; confirmation refused.")
         state["status"] = "ACTIVE"
@@ -763,65 +904,85 @@ def confirm(op: str) -> None:
     say("ACTIVE: authenticated fresh SSH session confirmed; ongoing guard remains armed.", "OK")
 
 
-def recover() -> None:
+def recover(reason: str = "service_exit_or_manual_recovery") -> None:
     require_root()
+    require_client_role()
     with locked():
-        reconcile("service_exit_or_manual_recovery")
+        if not service_terminated():
+            fail("Cannot recover with a live/unverified proxy process. Use 'off' first.")
+        reconcile(reason)
 
 
 def stop_proxy() -> None:
     require_root()
+    require_client_role()
     with locked():
         state = read_json(STATE, {"status": "DIRECT"})
         if state.get("status") in ("PENDING", "ACTIVE"):
-            state["status"] = "STOPPING"
-            write_json(STATE, state)
-        # Do not hold the lock across systemctl stop: ExecStopPost calls recover.
-    if is_active(SERVICE):
-        subprocess.run(["systemctl", "stop", SERVICE], timeout=30, check=False)
-    recover()
+            write_json(STATE, {**state, "status": "STOPPING"})
+    stop_and_recover("manual_off")
 
 
 def guard() -> None:
     require_root()
-    with locked():
+    require_client_role()
+    try:
+        return guarded_check()
+    except ConnectError as exc:
+        if str(exc).startswith("Another Simple Connect operation is running.") and service_terminated():
+            # The manager is doing preflight/setup, but no proxy process
+            # exists. No firewall state could be intercepted. The periodic
+            # timer will check again; do not trigger OnFailure unnecessarily.
+            say("Guard deferred during non-networking manager operation.", "WARN")
+            return
+        raise
+
+
+def guarded_check() -> None:
+    with locked(wait_seconds=6):
         state = read_json(STATE, {"status": "DIRECT"})
         status = state.get("status")
+        # DIRECT is inconsistent if a service still has a live main PID.
         if status == "DIRECT":
-            if current_table() is not None:
-                fail("Unexpected nftables table while Direct: manual inspection required.")
-            return
-        if status == "UNCERTAIN":
-            # Ask systemd to stop without blocking on ExecStopPost and our lock.
-            if is_active(SERVICE):
-                subprocess.run(["systemctl", "--no-block", "stop", SERVICE], timeout=10, check=False)
-            fail("Previous recovery UNCERTAIN: proxy stop requested; operator inspection required.")
-        stale_boot = state.get("boot") != boot_id()
-        expired = status == "PENDING" and int(time.time()) >= int(state.get("deadline", 0))
-        process_lost = status in ("ACTIVE", "PENDING") and not is_active(SERVICE)
-        startup_grace = status == "PENDING" and int(time.time()) - int(state.get("started", 0)) < 45
-        observed_table = current_table()
-        changed = observed_table is not None and bool(state.get("table_sha256")) and not table_is_ours(
-            observed_table, str(state["table_sha256"])
-        )
-        missing = observed_table is None and status in ("ACTIVE", "PENDING") and not startup_grace
-        if not (stale_boot or expired or (process_lost and not startup_grace) or changed or missing or status == "STOPPING"):
-            return
-        # Dropping the lock is necessary: systemd ExecStopPost may call recover.
-    if is_active(SERVICE):
-        subprocess.run(["systemctl", "stop", SERVICE], timeout=30, check=False)
-    recover()
+            if not service_terminated():
+                mark_uncertain("direct_with_live_service")
+            elif any_proxy_tables():
+                mark_uncertain("direct_with_firewall_table")
+                fail("DIRECT with an untracked sshuttle nftables table: UNCERTAIN.")
+            else:
+                return
+        elif status == "UNCERTAIN":
+            if service_terminated():
+                fail("Recovery UNCERTAIN: firewall requires manual verification.")
+        else:
+            stale_boot = state.get("boot") != boot_id()
+            expired = status == "PENDING" and int(time.time()) >= int(state.get("deadline", 0))
+            process_lost = status in ("ACTIVE", "PENDING") and not is_active(SERVICE)
+            startup_grace = status == "PENDING" and int(time.time()) - int(state.get("started", 0)) < 45
+            observed_table = current_table(state)
+            changed = observed_table is not None and bool(state.get("table_sha256")) and not table_is_ours(
+                observed_table, str(state["table_sha256"])
+            )
+            missing = observed_table is None and status in ("ACTIVE", "PENDING") and not startup_grace
+            if not (stale_boot or expired or (process_lost and not startup_grace)
+                    or changed or missing or status == "STOPPING"):
+                return
+        # Stop outside the lock; ExecStopPost may need it.
+    stop_and_recover("guard")
 
 
 def service_run() -> None:
     require_root()
+    require_client_role()
     cfg = read_config()
     if not is_active(GUARD_TIMER):
         fail("Guard not armed; refusing to start.")
     state = read_json(STATE)
     if state.get("status") != "PENDING" or state.get("boot") != boot_id():
         fail("Refusing unguarded service start.")
-    excluded = list(EXCLUDED) + [cfg["remote_ip"] + "/32", str(state["management_ip"]) + "/32"]
+    if str(state.get("remote_ip")) != cfg["remote_ip"]:
+        fail("Remote endpoint changed during activation; refusing service start.")
+    excluded = stored_exclusions(state)
     argv = [
         "/usr/bin/python3", "-m", "sshuttle", "--method=nft", "--dns",
         "--listen", f"127.0.0.1:{proxy_port(state)}", "--remote", "sc-remote",
@@ -844,8 +1005,10 @@ def status() -> None:
     if state.get("status") != "DIRECT":
         print(f"Proxy listener port: {proxy_port(state)}")
     print(f"Independent guard: {'running' if is_active(GUARD_TIMER) else 'not active'}")
-    table = current_table() if shutil.which("nft") else None
+    table = current_table(state) if shutil.which("nft") and state.get("status") != "DIRECT" else None
     print(f"Owned nftables table: {'present' if table else 'absent'}")
+    if state.get("status") == "DIRECT" and shutil.which("nft") and any_proxy_tables():
+        print("WARNING: untracked sshuttle nftables table(s) present; inspect manually.")
     if table and state.get("table_sha256"):
         print(f"Table identity: {'MATCH' if table_is_ours(table, state['table_sha256']) else 'CHANGED'}")
     if state.get("status") == "PENDING":
@@ -856,6 +1019,7 @@ def status() -> None:
 
 
 def test_path(url: str) -> None:
+    require_client_role()
     read_config()
     if not url.startswith("https://") or " " in url or len(url) > 500:
         fail("Test URL must be a short HTTPS URL.")
@@ -890,9 +1054,9 @@ def uninstall(yes: bool) -> None:
     if role_path.is_file() and role_path.read_text().strip() == "server":
         # The remote role never installed nftables, a tunnel, or systemd
         # service units. Do not require local nft tooling to uninstall.
-        if CONF.exists() or STATE.exists():
-            fail("Unexpected client state on SERVER role; refusing ambiguous cleanup.")
-        for path in (APP, COMMAND, role_path):
+        if STATE.exists() or not service_terminated():
+            fail("Unexpected active CLIENT state on SERVER role; refusing ambiguous cleanup.")
+        for path in (CONF, SSH_CONF, KNOWN_HOSTS, APP, COMMAND, role_path):
             if path.is_file() and not path.is_symlink():
                 path.unlink()
         if ETC.is_dir() and not any(ETC.iterdir()):

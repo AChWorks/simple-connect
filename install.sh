@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 readonly OFFICIAL_MANAGER="https://raw.githubusercontent.com/AChWorks/simple-connect/main/simple_connect.py"
 readonly OFFICIAL_WHEEL="https://files.pythonhosted.org/packages/25/1d/c409e26b9d5d26e6f07466c3d4662abb1c3ca4810424f66f38e1b5e54f33/sshuttle-2.0.0-py3-none-any.whl"
-readonly MANAGER_SHA256="7986f786b6beb288cad9ea9f6e9b8c88b9801370a40c31874c58adb5a62f1c88"
+readonly MANAGER_SHA256="d430821fb43d237f51abccb9671c591b4716ecbed017e91d71bb102569fe79aa"
 readonly WHEEL_SHA256="506a8cad2f047ca42f0d784654cb3459e2193bfad79d0a03734e0e07473f2bbb"
 readonly DEFAULT_MIRROR="https://helpe.ir/simple-connect"
 
@@ -48,8 +48,8 @@ if ! command -v python3 >/dev/null 2>&1; then
     apt-get update
     apt-get install -y --no-install-recommends python3
 fi
-python3 -c 'import sys; assert sys.version_info >= (3,9)' ||
-    die "Python >=3.9 is required (tested initial target: Debian 13)."
+/usr/bin/python3 -c 'import sys; assert (3,10) <= sys.version_info[:2] < (4,0)' ||
+    die "System Python >=3.10 and <4.0 is required by sshuttle 2.0.0."
 
 if [[ -z "$role" ]]; then
     [[ -e /dev/tty ]] || die "Specify --role server|client in noninteractive mode."
@@ -78,9 +78,9 @@ info "Manager SHA-256 verified."
 # A read-permission check alone is insufficient; probe a real open first.
 if ( : </dev/tty ) 2>/dev/null; then
     exec 3< /dev/tty
-    python3 "$temp/simple_connect.py" setup "$role" --wheel-url "$wheel_url" <&3
+    /usr/bin/python3 "$temp/simple_connect.py" setup "$role" --wheel-url "$wheel_url" <&3
     exec 3<&-
 else
-    python3 "$temp/simple_connect.py" setup "$role" --wheel-url "$wheel_url" </dev/null
+    /usr/bin/python3 "$temp/simple_connect.py" setup "$role" --wheel-url "$wheel_url" </dev/null
 fi
 printf '\n[OK] Installed. Manage with: sudo simple-connect\n'

@@ -23,6 +23,21 @@ jobs:
           set -euo pipefail
           bash scripts/build-mirror-bundle.sh
           (cd dist/simple-connect-mirror && sha256sum -c SHA256SUMS)
+          test "$(find dist/simple-connect-mirror -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 4
+          before="$(cd dist/simple-connect-mirror && sha256sum install.sh simple_connect.py sshuttle-2.0.0-py3-none-any.whl)"
+          # Local builds must fail rather than silently package foreign files.
+          printf 'not part of the distribution\n' > dist/simple-connect-mirror/.foreign-file
+          if bash scripts/build-mirror-bundle.sh; then
+            echo "ERROR: packaging accepted unexpected file" >&2
+            exit 1
+          fi
+          test -f dist/simple-connect-mirror/.foreign-file
+          rm dist/simple-connect-mirror/.foreign-file
+          bash scripts/build-mirror-bundle.sh
+          (cd dist/simple-connect-mirror && sha256sum -c SHA256SUMS)
+          after="$(cd dist/simple-connect-mirror && sha256sum install.sh simple_connect.py sshuttle-2.0.0-py3-none-any.whl)"
+          test "$before" = "$after"
+          test "$(find dist/simple-connect-mirror -mindepth 1 -maxdepth 1 | wc -l)" -eq 4
       - name: Stage exact 4-file owner-upload mirror artifact
         uses: actions/upload-artifact@v4
         with:

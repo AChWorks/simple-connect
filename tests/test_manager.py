@@ -20,13 +20,30 @@ class SimpleConnectTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(sc.ConnectError):
                 sc.validate_ipv4(bad, public=True)
 
-    def test_management_peer_session_has_four_verified_fields(self):
-        with patch.dict(os.environ, {"SSH_CONNECTION": "203.0.113.10 53255 198.51.100.23 22"}):
-            self.assertEqual(sc.initial_ssh_connection(), "203.0.113.10 53255 198.51.100.23 22")
-        for broken in ("", "127.0.0.1 x 8.8.8.8 22", "random", "8.8.8.8 0 1.2.3.4 22"):
-            with self.subTest(broken=broken), patch.dict(os.environ, {"SSH_CONNECTION": broken}):
-                with self.assertRaises(sc.ConnectError):
-                    sc.initial_ssh_connection()
+    def test_kernel_verified_ssh_session_ignores_forged_environment(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            for pid, parent, exe in ((234,123,"/usr/bin/bash"), (123,1,"/usr/sbin/sshd-session")):
+                path=root/str(pid)
+                path.mkdir()
+                (path/"status").write_text(f"Name: bash\nPPid:\t{parent}\n")
+                (path/"exe").symlink_to(exe)
+                (path/"fd").mkdir()
+            (root/"123"/"fd"/"3").symlink_to("socket:[54321]")
+            (root/"net").mkdir()
+            (root/"net"/"tcp").write_text(
+                "  sl  local_address rem_address   st tx_queue:rx_queue tr:tm->when retrnsmt uid timeout inode\n"
+                "  0: 176433C6:0016 0A7100CB:C350 01 00000000:00000000 00:00000000 00000000 0 0 54321 1\n"
+            )
+            (root/"net"/"tcp6").write_text("sl local_address rem_address st\n")
+            expected="203.0.113.10 50000 198.51.100.23 22 54321"
+            with patch.dict(os.environ, {"SSH_CONNECTION":"8.8.8.8 12345 9.9.9.9 99"}):
+                self.assertEqual(sc.initial_ssh_connection(proc_root=root,pid=234),expected)
+            # Fresh TCP kernel inode proves a distinct connection even if
+            # SSH_CONNECTION was copied verbatim to the new shell.
+            (root/"123"/"fd"/"3").unlink()
+            with self.assertRaisesRegex(sc.ConnectError,"socket absent"):
+                sc.initial_ssh_connection(proc_root=root,pid=234)
 
     def test_state_atomic_roundtrip_and_schema_reject(self):
         with tempfile.TemporaryDirectory() as d:
@@ -85,39 +102,50 @@ class SimpleConnectTests(unittest.TestCase):
         self.assertNotIn("WantedBy=multi-user.target", units[sc.SERVICE])
 
     def test_service_run_requires_pending_state_before_exec(self):
-        with patch.object(sc, "require_root"), patch.object(sc, "read_config", return_value={"remote_ip": "8.8.8.8"}):
+        with patch.object(sc, "require_root"), patch.object(sc, "require_client_role"), patch.object(sc, "read_config", return_value={"remote_ip": "8.8.8.8"}):
             with patch.object(sc, "is_active", return_value=True), patch.object(sc, "read_json", return_value={"status": "DIRECT"}):
                 with patch.object(sc, "boot_id", return_value="same"), patch.object(os, "execvpe") as execv:
                     with self.assertRaises(sc.ConnectError):
                         sc.service_run()
                     execv.assert_not_called()
 
-    def test_service_command_excludes_private_remote_and_management_peers(self):
-        with patch.object(sc, "require_root"), patch.object(sc, "read_config", return_value={"remote_ip": "8.8.8.8"}):
-            with patch.object(sc, "is_active", return_value=True), patch.object(sc, "read_json", return_value={
-                "status": "PENDING", "boot": "same", "management_ip": "203.0.113.42"
-            }):
-                with patch.object(sc, "boot_id", return_value="same"), patch.object(os, "execvpe") as execv:
-                    sc.service_run()
-                    args = execv.call_args.args[1]
-                    self.assertEqual(args[-1], "0.0.0.0/0")
-                    self.assertIn("--method=nft", args)
-                    self.assertIn("--dns", args)
-                    self.assertIn("8.8.8.8/32", args)
-                    self.assertIn("203.0.113.42/32", args)
-                    self.assertIn("192.168.0.0/16", args)
+    def test_service_command_uses_persisted_ssh_and_onlink_exclusions(self):
+        expected=list(sc.EXCLUDED)+["8.8.8.8/32","203.0.113.42/32","11.88.0.0/24"]
+        state={"status":"PENDING","boot":"same","remote_ip":"8.8.8.8",
+               "management_ip":"203.0.113.42","exclusions":expected}
+        with patch.object(sc,"require_root"),patch.object(sc,"require_client_role"):
+            with patch.object(sc,"read_config",return_value={"remote_ip":"8.8.8.8"}):
+                with patch.object(sc,"is_active",return_value=True),patch.object(sc,"read_json",return_value=state):
+                    with patch.object(sc,"boot_id",return_value="same"),patch.object(os,"execvpe") as execv:
+                        sc.service_run()
+                        args=execv.call_args.args[1]
+                        self.assertIn("--method=nft",args)
+                        for cidr in expected:
+                            self.assertIn(cidr,args)
+                        self.assertEqual(args[-1],"0.0.0.0/0")
 
-    def test_confirm_refuses_same_ssh_session(self):
-        state = {
-            "status": "PENDING", "op": "ab12", "boot": "test", "deadline": 9999999999,
-            "original_ssh_connection": "203.0.113.10 50000 192.0.2.11 22",
-        }
+    def test_confirm_refuses_same_verified_ssh_session(self):
+        state={"status":"PENDING","op":"ab12","boot":"test","deadline":9999999999,
+               "original_ssh_connection":"203.0.113.10 50000 192.0.2.11 22 8001"}
         from contextlib import nullcontext
-        with patch.object(sc, "require_root"), patch.object(sc, "locked", return_value=nullcontext()):
-            with patch.object(sc, "read_json", return_value=state), patch.object(sc, "boot_id", return_value="test"):
-                with patch.object(sc, "initial_ssh_connection", return_value=state["original_ssh_connection"]):
-                    with self.assertRaisesRegex(sc.ConnectError, "fresh independent"):
+        with patch.object(sc,"require_root"),patch.object(sc,"require_client_role"),patch.object(sc,"locked",return_value=nullcontext()):
+            with patch.object(sc,"read_json",return_value=state),patch.object(sc,"boot_id",return_value="test"):
+                with patch.object(sc,"initial_ssh_connection",return_value=state["original_ssh_connection"]):
+                    with self.assertRaisesRegex(sc.ConnectError,"fresh independent"):
                         sc.confirm("ab12")
+
+    def test_expired_confirmation_never_adopts_a_new_session(self):
+        from contextlib import nullcontext
+        state={"status":"PENDING","op":"test","boot":"oldboot",
+               "deadline":1,"original_ssh_connection":"a"}
+        with patch.object(sc,"require_root"),patch.object(sc,"require_client_role"):
+            with patch.object(sc,"locked",return_value=nullcontext()):
+                with patch.object(sc,"read_json",return_value=state):
+                    with patch.object(sc,"boot_id",return_value="oldboot"):
+                        with patch.object(sc,"initial_ssh_connection") as session:
+                            with self.assertRaisesRegex(sc.ConnectError,"expired"):
+                                sc.confirm("test")
+                            session.assert_not_called()
 
     def test_confirm_rejects_wrong_operation(self):
         from contextlib import nullcontext
@@ -126,69 +154,40 @@ class SimpleConnectTests(unittest.TestCase):
                 with self.assertRaises(sc.ConnectError):
                     sc.confirm("def")
 
-    def test_guard_pending_timeout_requests_stop_and_recovery(self):
+    def test_guard_pending_timeout_requests_safe_stop(self):
         from contextlib import nullcontext
-        state = {
-            "status": "PENDING", "boot": "b", "deadline": 1, "started": 1,
-            "table_sha256": sc.table_hash({"nftables": []}),
-        }
-        with patch.object(sc, "require_root"), patch.object(sc, "locked", return_value=nullcontext()):
-            with patch.object(sc, "read_json", return_value=state), patch.object(sc, "boot_id", return_value="b"):
-                with patch.object(sc, "is_active", return_value=True), patch.object(sc, "current_table", return_value={"nftables": []}):
-                    with patch.object(sc, "recover") as recovered, patch.object(subprocess, "run") as stop:
+        state={"status":"PENDING","boot":"b","deadline":1,"started":1,
+               "table_sha256":sc.table_hash({"nftables":[]})}
+        with patch.object(sc,"require_root"),patch.object(sc,"require_client_role"),patch.object(sc,"locked",return_value=nullcontext()):
+            with patch.object(sc,"read_json",return_value=state),patch.object(sc,"boot_id",return_value="b"):
+                with patch.object(sc,"is_active",return_value=True),patch.object(sc,"current_table",return_value={"nftables":[]}):
+                    with patch.object(sc,"stop_and_recover") as stop:
                         sc.guard()
-                        stop.assert_called_once()
-                        self.assertIn("stop", stop.call_args.args[0])
-                        recovered.assert_called_once()
+                        stop.assert_called_once_with("guard")
 
-    def test_guard_active_missing_table_requests_stop(self):
+    def test_guard_active_missing_table_requests_safe_stop(self):
         from contextlib import nullcontext
-        state = {"status": "ACTIVE", "boot": "b", "table_sha256": "a" * 64}
-        with patch.object(sc, "require_root"), patch.object(sc, "locked", return_value=nullcontext()):
-            with patch.object(sc, "read_json", return_value=state), patch.object(sc, "boot_id", return_value="b"):
-                with patch.object(sc, "is_active", return_value=True), patch.object(sc, "current_table", return_value=None):
-                    with patch.object(sc, "recover") as recovered, patch.object(subprocess, "run") as stop:
+        state={"status":"ACTIVE","boot":"b","table_sha256":"a"*64}
+        with patch.object(sc,"require_root"),patch.object(sc,"require_client_role"),patch.object(sc,"locked",return_value=nullcontext()):
+            with patch.object(sc,"read_json",return_value=state),patch.object(sc,"boot_id",return_value="b"):
+                with patch.object(sc,"is_active",return_value=True),patch.object(sc,"current_table",return_value=None):
+                    with patch.object(sc,"stop_and_recover") as stop:
                         sc.guard()
-                        stop.assert_called_once()
-                        recovered.assert_called_once()
+                        stop.assert_called_once_with("guard")
 
-    def test_early_crash_table_shape_rejects_modified_or_foreign_resources(self):
-        p = 24567
-        name = f"sshuttle-ipv4-{p}"
-        state = {"status": "PENDING", "boot": "test-boot", "listen_port": p,
-                 "remote_ip": "8.8.8.8", "management_ip": "9.9.9.9", "table_sha256": ""}
-        def entry(kind, **fields):
-            return {kind: fields}
-        common = {"family": "inet", "table": name}
-        proto = [{"match": {"op": "!=", "left": {"meta": {"key": "nfproto"}}, "right": "ipv4"}}, {"return": None}]
-        fib = [{"match": {"op": "==", "left": {"fib": {"result": "type", "flags": ["daddr"]}}, "right": "local"}}, {"return": None}]
-        tcp = [{"match": {"op": "==", "left": {"meta": {"key": "l4proto"}}, "right": "tcp"}},
-               {"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "daddr"}}, "right": {"prefix": {"addr": "0.0.0.0", "len": 0}}}},
-               {"redirect": {"port": p}}]
-        entries = [
-            entry("table", family="inet", name=name, handle=12),
-            entry("chain", **common, name="output", handle=1, type="nat", hook="output", prio=-100, policy="accept"),
-            entry("chain", **common, name="prerouting", handle=2, type="nat", hook="prerouting", prio=-100, policy="accept"),
-            entry("chain", **common, name=name, handle=3),
-            entry("rule", **common, chain="output", handle=4, expr=[{"jump": {"target": name}}]),
-            entry("rule", **common, chain="prerouting", handle=5, expr=[{"jump": {"target": name}}]),
-            entry("rule", **common, chain=name, handle=6, expr=proto),
-            entry("rule", **common, chain=name, handle=7, expr=fib),
-            entry("rule", **common, chain=name, handle=8, expr=tcp),
-        ]
-        with patch.object(sc, "boot_id", return_value="test-boot"):
-            self.assertTrue(sc.safe_early_sshuttle_table({"nftables": entries}, state))
-            import copy
-            changed = copy.deepcopy(entries)
-            changed[-1]["rule"]["expr"][2]["redirect"]["port"] = p+1
-            self.assertFalse(sc.safe_early_sshuttle_table({"nftables": changed}, state))
-            changed = copy.deepcopy(entries)
-            changed[1]["chain"]["prio"] = -99
-            self.assertFalse(sc.safe_early_sshuttle_table({"nftables": changed}, state))
-            changed = copy.deepcopy(entries)
-            changed.append(entry("rule", **common, chain=name, handle=9, expr=[{"accept": None}]))
-            self.assertFalse(sc.safe_early_sshuttle_table({"nftables": changed}, state))
-            self.assertFalse(sc.safe_early_sshuttle_table({"nftables": entries}, {**state,"status":"ACTIVE"}))
+    def test_early_crash_never_deletes_unfingerprinted_firewall(self):
+        # Even an apparently exact sshuttle footprint cannot establish
+        # provenance if the full fingerprint was never recorded.
+        name="sshuttle-ipv4-23456"
+        data={"nftables":[{"table":{"family":"inet","name":name,"handle":1}},
+                          {"rule":{"family":"inet","table":name,"chain":"output",
+                                   "handle":2,"expr":[{"redirect":{"port":23456}}]}}]}
+        state={"status":"PENDING","listen_port":23456,"table_sha256":""}
+        with patch.object(sc,"current_table",return_value=data), patch.object(sc,"run") as execute:
+            self.assertFalse(sc.owned_cleanup(state))
+            modified={"nftables":data["nftables"]+[{"rule":{"chain":"output","handle":3}}]}
+            self.assertFalse(sc.owned_cleanup(state))
+            execute.assert_not_called()
 
     def test_server_uninstall_does_not_require_nft_or_client_service(self):
         with tempfile.TemporaryDirectory() as d:
@@ -201,12 +200,178 @@ class SimpleConnectTests(unittest.TestCase):
             app.write_text("manager")
             cmd.write_text("wrapper")
             with patch.object(sc, "ETC", etc), patch.object(sc, "APP", app), patch.object(sc, "COMMAND", cmd):
-                with patch.object(sc, "require_root"), patch.object(sc, "stop_proxy") as stop:
+                with patch.object(sc, "require_root"), patch.object(sc, "service_terminated", return_value=True), patch.object(sc, "stop_proxy") as stop:
                     sc.uninstall(True)
                     stop.assert_not_called()
             self.assertFalse(app.exists())
             self.assertFalse(cmd.exists())
             self.assertFalse(etc.exists())
+
+    def test_systemd_termination_is_verified_not_inferred_from_is_active(self):
+        def show(active, main, control):
+            return subprocess.CompletedProcess([], 0,
+                f"ActiveState={active}\nMainPID={main}\nControlPID={control}\nLoadState=loaded\n", "")
+        with patch.object(sc, "run", side_effect=[
+                show("active",123,0), show("deactivating",0,9999),
+                show("deactivating",0,os.getpid()),show("inactive",0,0)]):
+            self.assertFalse(sc.service_terminated())
+            self.assertFalse(sc.service_terminated())
+            self.assertTrue(sc.service_terminated())
+            self.assertTrue(sc.service_terminated())
+
+    def test_manual_recover_refuses_live_proxy_before_firewall_touch(self):
+        from contextlib import nullcontext
+        with patch.object(sc,"require_root"),patch.object(sc,"require_client_role"):
+            with patch.object(sc,"locked",return_value=nullcontext()):
+                with patch.object(sc,"service_terminated",return_value=False),patch.object(sc,"owned_cleanup") as nft:
+                    with self.assertRaisesRegex(sc.ConnectError,"live/unverified"):
+                        sc.recover()
+                    nft.assert_not_called()
+
+    def test_systemctl_stop_failure_cannot_write_direct_or_delete_rules(self):
+        from contextlib import nullcontext
+        current={"status":"ACTIVE","table_sha256":"a"*64}
+        with patch.object(sc,"service_terminated",return_value=False):
+            with patch.object(sc,"run",return_value=subprocess.CompletedProcess([],1,"","stop failed")):
+                with patch.object(sc,"locked",return_value=nullcontext()):
+                    with patch.object(sc,"read_json",return_value=current),patch.object(sc,"write_json") as write:
+                        with patch.object(sc,"owned_cleanup") as nft:
+                            with self.assertRaisesRegex(sc.ConnectError,"UNCERTAIN"):
+                                sc.stop_and_recover("failed_stop")
+                            self.assertEqual(write.call_args.args[1]["status"],"UNCERTAIN")
+                            nft.assert_not_called()
+
+    def test_reconcile_never_persists_direct_when_proxy_may_be_running(self):
+        state={"status":"ACTIVE","table_sha256":"a"*64}
+        with patch.object(sc,"service_terminated",return_value=False),patch.object(sc,"read_json",return_value=state):
+            with patch.object(sc,"write_json") as write,patch.object(sc,"owned_cleanup") as nft:
+                with self.assertRaisesRegex(sc.ConnectError,"termination NOT verified"):
+                    sc.reconcile("test")
+                self.assertEqual(write.call_args.args[1]["status"],"UNCERTAIN")
+                nft.assert_not_called()
+
+    def test_reconcile_refuses_direct_with_foreign_orphan_table(self):
+        from contextlib import nullcontext
+        with patch.object(sc,"service_terminated",return_value=True):
+            with patch.object(sc,"read_json",return_value={"status":"STOPPING"}):
+                with patch.object(sc,"owned_cleanup",return_value=True):
+                    with patch.object(sc,"any_proxy_tables",return_value=True):
+                        with patch.object(sc,"write_json") as write:
+                            with self.assertRaisesRegex(sc.ConnectError,"untracked"):
+                                sc.reconcile("test")
+                            self.assertEqual(write.call_args.args[1]["status"],"UNCERTAIN")
+
+    def test_guard_detects_direct_with_unexpected_running_service(self):
+        from contextlib import nullcontext
+        with patch.object(sc,"require_root"),patch.object(sc,"require_client_role"),patch.object(sc,"locked",return_value=nullcontext()):
+            with patch.object(sc,"read_json",return_value={"status":"DIRECT"}):
+                with patch.object(sc,"service_terminated",return_value=False):
+                    with patch.object(sc,"mark_uncertain") as mark,patch.object(sc,"stop_and_recover") as stop:
+                        sc.guard()
+                        mark.assert_called_once_with("direct_with_live_service")
+                        stop.assert_called_once_with("guard")
+
+    def test_uninstall_refuses_failed_shutdown_without_erasing_files(self):
+        with patch.object(sc,"require_root"),patch.object(sc,"stop_proxy",side_effect=sc.ConnectError("incomplete stop")):
+            with patch.object(sc,"unit_action") as action:
+                with self.assertRaisesRegex(sc.ConnectError,"incomplete stop"):
+                    sc.uninstall(True)
+                action.assert_not_called()
+
+    def test_route_discovery_protects_public_onlink_and_gateway(self):
+        routes=[
+            {"dst":"203.0.113.0/24","dev":"eth0","scope":"link","protocol":"kernel"},
+            {"dst":"10.12.0.0/16","dev":"eth1","scope":"link"},
+            {"dst":"default","gateway":"203.0.113.1","dev":"eth0"},
+            {"dst":"45.45.45.45","gateway":"203.0.113.1","dev":"eth0"},
+        ]
+        result=subprocess.CompletedProcess([],0,json.dumps(routes),"")
+        with patch.object(sc,"run",return_value=result):
+            excluded=sc.effective_exclusions("8.8.8.8","198.51.100.10")
+        for cidr in ("203.0.113.0/24","203.0.113.1/32",
+                     "10.12.0.0/16","198.51.100.10/32","8.8.8.8/32"):
+            self.assertIn(cidr,excluded)
+        self.assertNotIn("45.45.45.45/32",excluded)
+        self.assertEqual(sc.stored_exclusions({"exclusions":excluded,
+                                               "remote_ip":"8.8.8.8",
+                                               "management_ip":"198.51.100.10"}),excluded)
+
+    def test_route_discovery_rejects_unbounded_onlink_default(self):
+        result=subprocess.CompletedProcess([],0,json.dumps([{"dst":"default","dev":"ppp0","scope":"link"}]),"")
+        with patch.object(sc,"run",return_value=result):
+            with self.assertRaisesRegex(sc.ConnectError,"on-link IPv4 default"):
+                sc.effective_exclusions("8.8.8.8","9.9.9.9")
+
+    def test_service_rejects_missing_protected_local_routes(self):
+        state={"exclusions":list(sc.EXCLUDED)+["8.8.8.8/32"],
+               "remote_ip":"8.8.8.8","management_ip":"203.0.113.15"}
+        with self.assertRaisesRegex(sc.ConnectError,"omit"):
+            sc.stored_exclusions(state)
+
+    def test_server_rejects_client_configuration_before_any_write(self):
+        with tempfile.TemporaryDirectory() as d:
+            etc=Path(d)
+            (etc/"role").write_text("server\n")
+            with patch.object(sc,"ETC",etc),patch.object(sc,"require_root"):
+                with patch.object(sc,"atomic_write") as write:
+                    with self.assertRaisesRegex(sc.ConnectError,"CLIENT"):
+                        sc.configure("8.8.8.8","root",22,"/root/.ssh/id_ed25519","bad")
+                    write.assert_not_called()
+
+    def test_server_legacy_config_is_cleanly_uninstalled_without_tunnel(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); etc=root/"etc"; etc.mkdir()
+            (etc/"role").write_text("server\n")
+            config=etc/"config.json"; config.write_text("{}")
+            app=root/"app";app.write_text("installed")
+            cmd=root/"bin";cmd.write_text("installed")
+            with patch.object(sc,"ETC",etc),patch.object(sc,"CONF",config),patch.object(sc,"STATE",root/"absent_state"):
+                with patch.object(sc,"SSH_CONF",etc/"ssh_config"),patch.object(sc,"KNOWN_HOSTS",etc/"known_hosts"):
+                    with patch.object(sc,"APP",app),patch.object(sc,"COMMAND",cmd),patch.object(sc,"require_root"):
+                        with patch.object(sc,"service_terminated",return_value=True):
+                            sc.uninstall(True)
+            self.assertFalse(config.exists())
+            self.assertFalse(app.exists())
+            self.assertFalse(cmd.exists())
+            self.assertFalse(etc.exists())
+
+    def test_existing_uncertain_client_setup_cannot_replace_recovery_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            etc=root/"etc";etc.mkdir()
+            (etc/"role").write_text("client\n")
+            state=root/"state.json";state.write_text('{"schema":1,"status":"UNCERTAIN"}')
+            with patch.object(sc,"ETC",etc),patch.object(sc,"STATE",state),patch.object(sc,"require_root"):
+                with patch.object(sc,"install_requirements") as installer:
+                    with self.assertRaisesRegex(sc.ConnectError,"Recovery unresolved"):
+                        sc.setup("client","https://unused.example/x")
+                    installer.assert_not_called()
+
+    def test_requires_python310_local_and_remote_contract(self):
+        with patch.object(sc.sys,"version_info",(3,9,20)):
+            with self.assertRaisesRegex(sc.ConnectError,"3.10"):
+                sc.require_supported_python()
+        with patch.object(sc.sys,"version_info",(3,13,5)):
+            with patch.object(sc.subprocess,"run",return_value=subprocess.CompletedProcess([],0,"","")):
+                sc.require_supported_python()
+        with patch.object(sc,"run",return_value=subprocess.CompletedProcess([],0,"","")) as remote:
+            sc.remote_python_test()
+            self.assertIn("(3, 10)",remote.call_args.args[0][-1])
+
+    def test_ssh_session_parse_requires_established_kernel_socket(self):
+        line="  0: 176433C6:0016 0A7100CB:C350 01 00000000:00000000 00:00000000 00000000 0 0 54321 1"
+        self.assertEqual(sc.parse_proc_tcp_line(line),
+                         ("203.0.113.10",50000,"198.51.100.23",22,54321))
+        self.assertIsNone(sc.parse_proc_tcp_line(line.replace(" 01 "," 0A ")))
+
+    def test_guard_skips_benign_idle_manager_lock_contention(self):
+        with patch.object(sc,"require_root"),patch.object(sc,"require_client_role"):
+            with patch.object(sc,"guarded_check",side_effect=sc.ConnectError("Another Simple Connect operation is running. Try again shortly.")):
+                with patch.object(sc,"service_terminated",return_value=True):
+                    sc.guard()
+                with patch.object(sc,"service_terminated",return_value=False):
+                    with self.assertRaises(sc.ConnectError):
+                        sc.guard()
 
     def test_bootstrap_hash_matches_manager(self):
         repo = Path(__file__).resolve().parents[1]

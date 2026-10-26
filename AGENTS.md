@@ -8,3 +8,6 @@
 - Updating simple_connect.py requires updating the exact pinned MANAGER_SHA256 in install.sh in the **same candidate**. The fixed HTTPS mirror is https://helpe.ir/simple-connect/ and may be selected using --mirror. The wheel's immutable upstream digest must be validated for original and independent mirror.
 - Run hermetic tests, real disposable isolated-host regression and a fresh author-separated HIGH_ASSURANCE independent review before merging privileged network code. Real hosting installation/activation needs a separate explicit rollout and recovery approval.
 - Source/PR/CI are truth for candidate state; README documents stable usage and truthful limitations. No chat-dependent state or speculative release claims.
+
+- Independent review PR #1 identified that main was NOT protected. Confirm an effective GitHub review+required-CI branch protection/ruleset with Owner approval before merge; never call an unprotected branch protected based on PR text alone.
+- A stopped process is a prerequisite to claiming DIRECT or deleting an owned firewall table. Early tables without a persisted exact hash are UNKNOWN/UNCERTAIN, even if they resemble the upstream sshuttle rules. Preserve the operator's network ownership.
