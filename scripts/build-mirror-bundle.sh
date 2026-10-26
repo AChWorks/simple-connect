@@ -50,6 +50,10 @@ mkdir -p "$out"
 for file in "${allowed[@]}"; do
   mv -f -- "$stage/$file" "$out/$file"
 done
+# This directory is the intentionally public HTTPS mirror payload. Staging
+# stays private; only verified final output receives public-readable modes.
+chmod 0755 "$out" "$out/install.sh" "$out/simple_connect.py"
+chmod 0644 "$out/$wheel" "$out/SHA256SUMS"
 (cd "$out" && sha256sum -c SHA256SUMS)
 [[ "$(find "$out" -mindepth 1 -maxdepth 1 | wc -l)" -eq 4 ]] || {
   echo '[ERROR] Mirror output does not have exactly four entries.' >&2; exit 1;
