@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import stat
 import subprocess
@@ -453,6 +454,42 @@ class CliOnboardingTests(unittest.TestCase):
             self.assertEqual(sc.paint("READY", "good"), "READY")
             sc.clear_menu()
             self.assertEqual(plain.getvalue(), "")
+
+    def test_semantic_terminal_colors_and_wrapping_at_40_columns(self):
+        ansi = re.compile(r"\x1b\[[0-9;]*m")
+        with patch.dict(os.environ, {"TERM": "xterm-256color"}, clear=True), (
+             patch.object(sc.shutil, "get_terminal_size",
+                          return_value=os.terminal_size((40, 24)))), (
+             patch.object(sc.sys, "stdout", TerminalBuffer())) as tty:
+            sc.terminal_section("CONNECTION")
+            sc.terminal_field("Link", "ACTIVE", tone="good")
+            sc.say("A short verified confirmation was successfully recorded.", "OK")
+            sc.say("Inspect uncertain firewall ownership before trying again.", "WARN")
+            sc.say("Unable to verify the current service state safely.", "ERROR")
+            sc.menu_option(10, "Uninstall (destructive)", tone="error")
+            raw = tty.getvalue()
+            plain = ansi.sub("", raw)
+            self.assertIn("\033[1;32m", raw)
+            self.assertIn("\033[1;33m", raw)
+            self.assertIn("\033[1;31m", raw)
+            self.assertIn("\033[1;36m", raw)
+            self.assertIn("[OK]", plain)
+            self.assertIn("[WARN]", plain)
+            self.assertIn("[ERROR]", plain)
+            self.assertTrue(all(len(line) <= 39 for line in plain.splitlines()),
+                            plain)
+        with patch.dict(os.environ, {"TERM": "dumb"}, clear=True), (
+             patch.object(sc.sys, "stdout", TerminalBuffer())) as dumb:
+            sc.terminal_field("Link", "ACTIVE", tone="good")
+            sc.say("Troubleshooting information.", "WARN")
+            self.assertNotIn("\x1b[", dumb.getvalue())
+            self.assertIn("[WARN]", dumb.getvalue())
+        with patch.dict(os.environ, {"TERM": "xterm", "NO_COLOR": "1"}, clear=True), (
+             patch.object(sc.sys, "stdout", TerminalBuffer())) as no_color:
+            sc.terminal_field("Link", "ACTIVE", tone="good")
+            sc.say("Troubleshooting information.", "ERROR")
+            self.assertNotIn("\x1b[", no_color.getvalue())
+            self.assertIn("[ERROR]", no_color.getvalue())
 
     def test_menu_bad_option_and_action_error_return_to_menu(self):
         result = io.StringIO()

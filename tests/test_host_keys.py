@@ -403,6 +403,8 @@ class HostKeyTests(unittest.TestCase):
         self.assertEqual({int(re.search(r"\d+", line).group()) for line in choices},
                          set(range(13)))
         self.assertTrue(all(len(line) <= 39 for line in rows), rows)
+        self.assertEqual([int(re.search(r"\d+", line).group()) for line in choices],
+                         list(range(1, 13)) + [0])
 
     def test_server_role_refuses_symlinked_role_even_if_contents_server(self):
         with tempfile.TemporaryDirectory() as d:
