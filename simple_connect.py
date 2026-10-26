@@ -26,7 +26,7 @@ import time
 import urllib.request
 import zipfile
 
-VERSION = "0.1.0-dev"
+VERSION = "0.1.0"
 SCHEMA_VERSION = 1
 SSHUTTLE_VERSION = "2.0.0"
 WHEEL_SHA256 = "506a8cad2f047ca42f0d784654cb3459e2193bfad79d0a03734e0e07473f2bbb"

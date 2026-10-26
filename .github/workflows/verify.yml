@@ -15,7 +15,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 --version
-          python3 -m py_compile simple_connect.py
+          python3 -m py_compile simple_connect.py scripts/build-release-assets.py
           bash -n install.sh scripts/build-mirror-bundle.sh
           python3 -m unittest discover -s tests -v
       - name: Verify independent mirror artifact checksums
@@ -38,6 +38,30 @@ jobs:
           after="$(cd dist/simple-connect-mirror && sha256sum install.sh simple_connect.py sshuttle-2.0.0-py3-none-any.whl)"
           test "$before" = "$after"
           test "$(find dist/simple-connect-mirror -mindepth 1 -maxdepth 1 | wc -l)" -eq 4
+          test "$(stat -c %a dist/simple-connect-mirror)" = 755
+          test "$(stat -c %a dist/simple-connect-mirror/install.sh)" = 755
+          test "$(stat -c %a dist/simple-connect-mirror/simple_connect.py)" = 755
+          test "$(stat -c %a dist/simple-connect-mirror/SHA256SUMS)" = 644
+          test "$(stat -c %a dist/simple-connect-mirror/sshuttle-2.0.0-py3-none-any.whl)" = 644
+      - name: Verify deterministic release ZIP and checksum sidecar
+        run: |
+          set -euo pipefail
+          python3 scripts/build-release-assets.py
+          (cd dist && sha256sum -c simple-connect-mirror.zip.sha256)
+          digest_before="$(sha256sum dist/simple-connect-mirror.zip | awk '{print $1}')"
+          python3 scripts/build-release-assets.py
+          digest_after="$(sha256sum dist/simple-connect-mirror.zip | awk '{print $1}')"
+          test "$digest_before" = "$digest_after"
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          src = Path("dist/simple-connect-mirror")
+          with ZipFile("dist/simple-connect-mirror.zip") as archive:
+              names = ["install.sh", "simple_connect.py", "sshuttle-2.0.0-py3-none-any.whl", "SHA256SUMS"]
+              assert archive.namelist() == names
+              assert all(archive.read(name) == (src / name).read_bytes() for name in names)
+              assert archive.testzip() is None
+          PY
       - name: Stage exact 4-file owner-upload mirror artifact
         uses: actions/upload-artifact@v4
         with:
@@ -47,5 +71,14 @@ jobs:
             dist/simple-connect-mirror/simple_connect.py
             dist/simple-connect-mirror/sshuttle-2.0.0-py3-none-any.whl
             dist/simple-connect-mirror/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+      - name: Stage release ZIP and sidecar (not a public release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: simple-connect-release-assets
+          path: |
+            dist/simple-connect-mirror.zip
+            dist/simple-connect-mirror.zip.sha256
           if-no-files-found: error
           retention-days: 14

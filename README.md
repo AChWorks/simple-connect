@@ -27,7 +27,10 @@ curl -fsSL https://raw.githubusercontent.com/AChWorks/simple-connect/main/instal
 https://helpe.ir/simple-connect/. Upload the **exact four files**
 install.sh, simple_connect.py, sshuttle-2.0.0-py3-none-any.whl,
 and SHA256SUMS directly into the website's public /simple-connect/ directory
-(no additional nested folder). When that HTTPS path serves the files correctly:
+(no additional nested folder). Ensure the deployed directory is traversable
+by the HTTPS server and the four public distribution files are readable;
+do not expose any credentials or unrelated web-root contents. When that
+HTTPS path serves the files correctly:
 
 ~~~bash
 curl -fsSL https://helpe.ir/simple-connect/install.sh | sudo bash -s -- --mirror
@@ -48,6 +51,28 @@ Prepare an independent mirror folder using:
 bash scripts/build-mirror-bundle.sh
 # Upload the contents of dist/simple-connect-mirror/ over your authenticated deployment path.
 ~~~
+
+After the release version and embedded manager SHA256 are aligned, prepare
+**reproducible release upload assets** from the same verified four-file
+mirror directory:
+
+~~~bash
+python3 scripts/build-release-assets.py
+(cd dist && sha256sum -c simple-connect-mirror.zip.sha256)
+# Output: dist/simple-connect-mirror.zip and dist/simple-connect-mirror.zip.sha256
+~~~
+
+The release archive contains exactly the same four flat files, including
+the official wheel's upstream license. Both builders reject a symlinked
+`dist/` parent to avoid redirecting output outside this checkout; the
+release builder also requires staged manager and installer files to match
+the checked-out sources. It rejects a `-dev` version, mismatched checksums,
+missing licensing and unexpected mirror entries. It uses fixed ZIP metadata
+and no compression for stable byte-for-byte archives. CI checks repeatability
+and uploads the pair as **temporary** artifacts; these are not a public GitHub Release. Publish
+the matching tag and two permanent Release assets only after explicit
+Owner authorization and relevant review/CI gates. Extraction and hosting
+the four files on a trusted custom HTTPS mirror remain operator-controlled.
 
 The mirror hostname is owner-selected; its web-root storage and actual file deployment remain owner-managed. Even with the mirror, operating-system apt prerequisites must be obtainable from a configured Debian/local mirror. The setup process only installs **missing** apt packages and never performs a blanket apt upgrade.
 
