@@ -2,12 +2,16 @@
 """Simple Connect: a small, guarded sshuttle manager for Debian Linux hosts.
 
 This file is also the installed management entry point. It never chooses a
-remote endpoint, creates SSH credentials, or enables traffic during setup.
+remote endpoint or enables traffic during setup. Operator-requested SSH key
+creation/enrollment is an explicit, separate interactive step.
 """
 from __future__ import annotations
 
 import argparse
+import base64
+import errno
 import contextlib
+from dataclasses import dataclass
 import fcntl
 import hashlib
 import ipaddress
@@ -16,6 +20,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import shlex
 import shutil
 import socket
@@ -26,7 +31,7 @@ import time
 import urllib.request
 import zipfile
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 SCHEMA_VERSION = 1
 SSHUTTLE_VERSION = "2.0.0"
 WHEEL_SHA256 = "506a8cad2f047ca42f0d784654cb3459e2193bfad79d0a03734e0e07473f2bbb"
@@ -60,16 +65,59 @@ EXCLUDED = (
 )
 
 
+KEY_PATH = Path("/root/.ssh/simple_connect_ed25519")
+COLORS = {
+    "title": "\033[1;34m", "heading": "\033[1;36m",
+    "good": "\033[1;32m", "warn": "\033[1;33m",
+    "error": "\033[1;31m", "muted": "\033[2m",
+    "accent": "\033[1;35m",
+}
+
+
 class ConnectError(Exception):
     pass
 
 
+def color_enabled() -> bool:
+    return (sys.stdout.isatty() and "NO_COLOR" not in os.environ
+            and os.environ.get("TERM", "") != "dumb")
+
+
+def paint(value: str, tone: str) -> str:
+    if not color_enabled():
+        return value
+    return f"{COLORS[tone]}{value}\033[0m"
+
+
 def say(message: str, kind: str = "INFO") -> None:
-    colors = {"INFO": "\033[36m", "OK": "\033[32m", "WARN": "\033[33m", "ERROR": "\033[31m"}
-    prefix = f"[{kind}]"
-    if sys.stdout.isatty() and os.environ.get("NO_COLOR") is None:
-        prefix = f"{colors.get(kind, '')}{prefix}\033[0m"
-    print(prefix, message, flush=True)
+    tone = {"OK": "good", "WARN": "warn", "ERROR": "error", "INFO": "heading"}
+    print(f"{paint(f'[{kind}]', tone.get(kind, 'heading'))} {message}", flush=True)
+
+
+def guidance(message: str) -> str:
+    """Human action to take, without hiding original error/provider detail."""
+    lower = message.lower()
+    if "identity file" in lower or "private key" in lower or "permission" in lower and "key" in lower:
+        return "Open Configure SSH to select or create a dedicated SSH key. Never paste a private key into a prompt."
+    if "fingerprint" in lower or "host key" in lower:
+        return "Check the remote ED25519 fingerprint from its trusted console; do not accept an unknown host key."
+    if "permission denied" in lower or "publickey" in lower or "password" in lower and "ssh" in lower:
+        return "Use SSH key access in the menu to enroll the public key; remote SSH policy may disallow passwords."
+    if "timed out" in lower or "connection refused" in lower or "no route to host" in lower:
+        return "Check the remote IP, SSH port, server sshd listener and firewall; retry Test SSH before ON."
+    if "uncertain" in lower or "firewall" in lower or "ownership" in lower:
+        return "Do not bypass recovery. Keep SSH access; inspect Status and Logs before attempting ON."
+    if "not configured" in lower or "configuration missing" in lower or "client role" in lower:
+        return "Install the correct role, then use Configure SSH and Test connection from the menu."
+    if "uninstall" in lower:
+        return "Use the guarded Uninstall option and preserve recovery state when cleanup is incomplete."
+    return "Use Status and Logs for details. Resolve the reported problem before trying the action again."
+
+
+def show_error(exc: BaseException) -> None:
+    message = str(exc).strip() or type(exc).__name__
+    say(message, "ERROR")
+    print(f"  {paint('Next:', 'heading')} {guidance(message)}")
 
 
 def fail(message: str) -> None:
@@ -194,18 +242,13 @@ def validate_config(cfg: dict) -> dict:
     except (ValueError, TypeError):
         fail("SSH port must be 1..65535.")
     cfg["ssh_port"] = port
-    key = Path(str(cfg["identity_file"]))
-    if not key.is_absolute() or re.search(r"[\n\r\x00]", str(key)):
-        fail("Identity file must be an absolute path.")
-    if not key.is_file() or key.is_symlink():
-        fail(f"Identity file missing or unsafe: {key}")
-    cfg["identity_file"] = str(key)
+    cfg["identity_file"] = str(private_key_path(str(cfg["identity_file"])))
     return cfg
 
 
 def banner() -> None:
-    print("\n" + "\033[1;34m" + "  SIMPLE CONNECT  " + "\033[0m" + f"v{VERSION}")
-    print("  SSH-based outbound IPv4 TCP / DNS  |  default DIRECT\n")
+    print(f"\n{paint('SIMPLE CONNECT', 'title')} v{VERSION}")
+    print("SSH-based outbound IPv4 TCP / DNS | defaults to DIRECT/OFF\n")
 
 
 def require_supported_python() -> None:
@@ -321,7 +364,8 @@ def install_requirements(role: str) -> None:
     if role == "server":
         needed["sshd"] = "openssh-server"
     else:
-        needed.update({"ssh": "openssh-client", "nft": "nftables", "curl": "curl", "ip": "iproute2"})
+        needed.update({"ssh": "openssh-client", "ssh-copy-id": "openssh-client",
+                       "nft": "nftables", "curl": "curl", "ip": "iproute2"})
     missing = sorted({pkg for exe, pkg in needed.items() if shutil.which(exe) is None})
     if missing:
         if shutil.which("apt-get") is None:
@@ -563,10 +607,8 @@ def setup(role: str, wheel_url: str) -> None:
     if initial_client:
         write_json(STATE, {"status": "DIRECT"})
     say("Client installed (Direct/OFF). Network interception is NOT enabled.", "OK")
-    if not CONF.exists() and sys.stdin.isatty():
-        answer = input("Configure remote SSH endpoint now? [Y/n] ").strip().lower()
-        if answer in ("", "y", "yes"):
-            configure(None, None, None, None, None)
+    if not CONF.exists():
+        say("Next step: Configure SSH from the menu to select/create a key and verify the remote host.", "INFO")
 
 
 def ask(value: str | None, label: str, default: str | None = None) -> str:
@@ -575,8 +617,500 @@ def ask(value: str | None, label: str, default: str | None = None) -> str:
     if not sys.stdin.isatty():
         fail(f"Missing {label}. Supply explicit configuration flags.")
     suffix = f" [{default}]" if default is not None else ""
-    entered = input(f"{label}{suffix}: ").strip()
+    entered = input(f"{paint(label, 'heading')}{suffix} (b=back): ").strip()
+    if entered.lower() in ("b", "back"):
+        fail("Setup cancelled. Previously saved configuration was not changed; any generated SSH key is retained.")
     return entered or (default or "")
+
+
+def yes_no(question: str, *, default: bool = False) -> bool:
+    if not sys.stdin.isatty():
+        fail("Interactive confirmation requires a terminal.")
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        answer = input(f"{paint(question, 'heading')} {suffix}: ").strip().lower()
+        if not answer:
+            return default
+        if answer in ("yes", "y"):
+            return True
+        if answer in ("no", "n", "b", "back"):
+            return False
+        say("Please enter Y or N. No action taken.", "WARN")
+
+
+def checked_field(value: str | None, label: str, default: str | None, validator):
+    """Retry one bad interactive field; explicit CLI flags still fail nonzero."""
+    while True:
+        raw = ask(value, label, default)
+        try:
+            return validator(raw)
+        except (ConnectError, ValueError) as exc:
+            if value is not None or not sys.stdin.isatty():
+                raise ConnectError(str(exc)) from exc
+            show_error(exc)
+
+
+def valid_user(value: str) -> str:
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,30}\$?", value, re.IGNORECASE):
+        fail("Invalid SSH username. Use letters, digits, underscore or hyphen.")
+    return value
+
+
+def valid_port(value: str) -> int:
+    try:
+        number = int(value)
+        if 1 <= number <= 65535:
+            return number
+    except ValueError:
+        pass
+    fail("SSH port must be an integer in the range 1..65535.")
+
+
+# ssh-copy-id uses shell evaluation around its -i filename. We must never
+# interpolate a user-selected pathname containing shell syntax into that helper.
+SAFE_KEY_PATH = re.compile(r"/[A-Za-z0-9_./-]+")
+
+
+def checked_key_name(value: str) -> Path:
+    path = Path(value)
+    if (not path.is_absolute() or not SAFE_KEY_PATH.fullmatch(value)
+            or any(part in (".", "..") for part in value.split("/"))):
+        fail("Unsafe SSH identity path. Use an absolute path with only letters, digits, /, ., _ or -.")
+    return path
+
+
+def trusted_key_parents(folder: Path) -> None:
+    """Reject replaceable parents; /tmp is accepted only as root-owned + sticky."""
+    trusted_owners = {0, os.geteuid()}
+    for parent in reversed((folder, *folder.parents)):
+        try:
+            info = os.lstat(parent)
+        except FileNotFoundError:
+            fail(f"SSH key directory missing: {parent}. Select a valid key or generate a dedicated one.")
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in trusted_owners:
+            fail(f"Unsafe/untrusted SSH key directory ownership or symlink: {parent}")
+        if info.st_mode & 0o022:
+            sticky_root = (info.st_uid == 0 and
+                           info.st_mode & stat.S_ISVTX and
+                           stat.S_ISDIR(info.st_mode))
+            if not sticky_root:
+                fail(f"SSH key parent directory is writable by others: {parent}")
+
+
+def private_key_path(value: str) -> Path:
+    key = checked_key_name(value)
+    trusted_key_parents(key.parent)
+    try:
+        meta = os.lstat(key)
+    except FileNotFoundError:
+        fail(f"Identity file missing or unsafe: {key}")
+    if not stat.S_ISREG(meta.st_mode):
+        fail(f"Identity file missing or unsafe (symlinks are not accepted): {key}")
+    if meta.st_mode & 0o077 or (os.geteuid() == 0 and meta.st_uid != 0):
+        fail(f"Private key permissions/ownership unsafe: {key}; expected root-owned mode 0600.")
+    if meta.st_uid not in {0, os.geteuid()}:
+        fail(f"Untrusted owner of private SSH key: {key}")
+    return key
+
+
+@contextlib.contextmanager
+def locked_key_directory(folder: Path):
+    """Advisory lock on the *directory inode*, not the networking-state lock."""
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        limit = time.monotonic() + 12
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= limit:
+                    fail("Another SSH key creation is running. Try again shortly.")
+                time.sleep(0.05)
+        trusted_key_parents(folder)
+        yield
+    finally:
+        os.close(fd)
+
+
+def create_dedicated_key() -> Path:
+    """Generate in a private staging dir and publish via no-replace hard links."""
+    require_root()
+    key = checked_key_name(str(KEY_PATH))
+    pub = Path(str(key) + ".pub")
+    folder = key.parent
+    # Parent must already exist and be trusted. Never create arbitrary
+    # ancestors from user-controlled path components.
+    trusted_key_parents(folder.parent)
+    # Two concurrent creators may both see an absent .ssh directory. Create
+    # idempotently, then verify ownership/mode before using or locking it.
+    folder.mkdir(mode=0o700, exist_ok=True)
+    trusted_key_parents(folder)
+    info = os.lstat(folder)
+    if info.st_mode & 0o077:
+        if not yes_no(f"Secure SSH key directory {folder} to mode 0700 before generating?", default=False):
+            fail("SSH key creation cancelled; the existing directory was not changed.")
+        folder.chmod(0o700)
+    with locked_key_directory(folder):
+        if folder.stat().st_mode & 0o077:
+            fail(f"SSH key directory remains unsafe: {folder}")
+        if any(p.exists() or p.is_symlink() for p in (key, pub)):
+            fail(f"Dedicated key already exists or is partially created: {key}. No overwrite attempted.")
+        say(f"Creating a dedicated ED25519 SSH identity at {key} (no passphrase for unattended tunnel).")
+        with tempfile.TemporaryDirectory(prefix=".sc-keygen-", dir=folder) as stage:
+            staged = Path(stage) / "identity"
+            staged_pub = Path(str(staged) + ".pub")
+            run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(staged),
+                 "-C", "simple-connect"], timeout=30)
+            private_key_path(str(staged))
+            if not staged_pub.is_file() or staged_pub.is_symlink():
+                fail("SSH key generation did not produce a valid public key.")
+            staged_pub.chmod(0o644)
+            try:
+                # Hard links fail with EEXIST even if another writer races:
+                # never use rename/replace for security-sensitive key paths.
+                os.link(staged, key, follow_symlinks=False)
+            except FileExistsError:
+                fail(f"Dedicated private key appeared during creation: {key}. No overwrite performed.")
+            try:
+                os.link(staged_pub, pub, follow_symlinks=False)
+            except BaseException as exc:
+                # Roll back only the inode linked by *this* process.
+                try:
+                    own = os.lstat(key)
+                    stage_inode = os.lstat(staged)
+                    if (own.st_dev, own.st_ino) == (stage_inode.st_dev, stage_inode.st_ino):
+                        key.unlink()
+                except FileNotFoundError:
+                    pass
+                if isinstance(exc, FileExistsError):
+                    fail(f"Another public key appeared during generation: {pub}. Nothing was overwritten; inspect the existing keypair.")
+                raise
+        private_key_path(str(key))
+        say(f"New SSH key created. Private key stays ONLY on this CLIENT: {key}", "OK")
+        return key
+
+
+def select_identity(explicit: str | None) -> str:
+    """Guide interactive selection and safe creation; noninteractive never auto-generates."""
+    if explicit is not None:
+        return str(private_key_path(explicit))
+    default = str(KEY_PATH)
+    for candidate in (KEY_PATH, Path("/root/.ssh/id_ed25519")):
+        try:
+            private_key_path(str(candidate))
+        except (ConnectError, OSError):
+            continue
+        default = str(candidate)
+        break
+    while True:
+        chosen = ask(explicit, "Private SSH key path", default)
+        try:
+            return str(private_key_path(chosen))
+        except ConnectError as exc:
+            if explicit is not None or not sys.stdin.isatty():
+                raise
+            show_error(exc)
+            missing = not Path(chosen).exists() and not Path(chosen).is_symlink()
+            if missing and yes_no(f"Generate a dedicated key at {KEY_PATH}?", default=True):
+                return str(create_dedicated_key())
+            say("Enter another existing key path or press b to return to the menu.", "INFO")
+
+
+def single_public_record(data: bytes) -> tuple[str, str]:
+    """A single plain OpenSSH public-key line, not an authorized_keys bundle."""
+    if len(data) > 8192:
+        fail("Public key file is too large; expected exactly one SSH key record.")
+    try:
+        raw = data.decode("ascii")
+    except UnicodeDecodeError:
+        fail("Public key must contain exactly one printable ASCII SSH key record.")
+    if raw.count("\n") > 1 or "\r" in raw:
+        fail("Public key must contain exactly one line; additional keys/records are not allowed.")
+    line = raw[:-1] if raw.endswith("\n") else raw
+    if not line or any(ord(c) < 32 or ord(c) > 126 for c in line):
+        fail("Public key contains unexpected control/extra content.")
+    fields = line.split(maxsplit=2)
+    if len(fields) < 2 or not (fields[0] in ("ssh-ed25519", "ssh-rsa")
+                              or fields[0].startswith("ecdsa-sha2-")
+                              or fields[0].startswith("sk-")):
+        fail("Public key must be a plain OpenSSH public-key record.")
+    if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", fields[1]):
+        fail("Public key data has unexpected characters.")
+    try:
+        if len(base64.b64decode(fields[1], validate=True)) < 16:
+            fail("Public key data is unexpectedly short.")
+    except (ValueError, base64.binascii.Error):
+        fail("Public key data is not valid base64.")
+    return fields[0], fields[1]
+
+
+def read_public_key_record(path: Path) -> tuple[str, str]:
+    """Read one trusted public-key record from an open NOFOLLOW descriptor."""
+    trusted_key_parents(path.parent)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:  # Symlink blocked by O_NOFOLLOW.
+            fail(f"Unsafe symlinked public SSH key: {path}")
+        raise
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, os.geteuid()}
+                or info.st_mode & 0o022):
+            fail(f"Unsafe public key owner/permissions: {path}")
+        if info.st_size > 8192:
+            fail(f"Public key file is too large: {path}")
+        content = os.read(fd, 8193)
+        return single_public_record(content)
+    finally:
+        os.close(fd)
+
+
+def validated_public_key(key: Path) -> Path:
+    """Verify the sole public key against a stable, passphrase-free private key."""
+    private_key_path(str(key))
+    pub = Path(str(key) + ".pub")
+    before = os.lstat(key)
+    response = run(["ssh-keygen", "-y", "-P", "", "-f", str(key)], timeout=12)
+    after = os.lstat(key)
+    fingerprint = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    if fingerprint(before) != fingerprint(after):
+        fail("Private SSH key changed during validation; public-key enrollment cancelled.")
+    expected = single_public_record(response.stdout.encode("utf-8"))
+    try:
+        actual = read_public_key_record(pub)
+    except FileNotFoundError:
+        # No atomic_write here: it could overwrite a public key published
+        # by another process between the existence check and final save.
+        try:
+            fd = os.open(pub, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        except FileExistsError:
+            fail(f"Public SSH key appeared during validation: {pub}; retry without overwriting.")
+        created = os.fstat(fd)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                os.fchmod(handle.fileno(), 0o644)
+                handle.write((" ".join(expected) + "\n").encode("ascii"))
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            # Remove only the inode we exclusively created. Never unlink a
+            # key that another operator replaced in the meantime.
+            try:
+                current = os.lstat(pub)
+                if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+                    pub.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        actual = read_public_key_record(pub)
+        say(f"Recovered matching public key: {pub}", "OK")
+    if actual != expected:
+        fail(f"Public key does not match selected private key: {pub}")
+    if fingerprint(os.lstat(key)) != fingerprint(after):
+        fail("Private SSH key changed during public-key validation; retry safely.")
+    return pub
+
+
+@dataclass(frozen=True)
+class EnrollmentIntent:
+    """The exact destination and SSH host identity for one operator consent."""
+    remote_ip: str
+    ssh_user: str
+    ssh_port: int
+    identity_file: str
+    host_record: bytes
+    host_fingerprint: str
+    config_revision: tuple[bytes | None, ...]
+
+
+def pinned_host_identity(cfg: dict, record: bytes) -> str:
+    """Validate one pinned ED25519 host-key line; return its OpenSSH SHA256."""
+    if not record or len(record) > 8192 or record.count(b"\n") != 1 or not record.endswith(b"\n"):
+        fail("Pinned SSH host key must contain exactly one record; run Configure SSH.")
+    try:
+        parts = record[:-1].decode("ascii").split()
+        expected_host = (cfg["remote_ip"] if cfg["ssh_port"] == 22
+                         else f"[{cfg['remote_ip']}]:{cfg['ssh_port']}")
+        if len(parts) != 3 or parts[0] != expected_host or parts[1] != "ssh-ed25519":
+            fail("Pinned SSH host key does not match the configured IP and port; run Configure SSH.")
+        raw = base64.b64decode(parts[2], validate=True)
+        if len(raw) < 32:
+            fail("Pinned ED25519 host key is malformed; run Configure SSH.")
+        return "SHA256:" + base64.b64encode(hashlib.sha256(raw).digest()).decode("ascii").rstrip("=")
+    except (UnicodeDecodeError, ValueError, base64.binascii.Error):
+        fail("Pinned SSH host key is invalid; run Configure SSH.")
+
+
+def read_pinned_host_record() -> bytes:
+    """Fail closed on mutable aliases, excessive content, or unsafe ownership."""
+    try:
+        fd = os.open(KNOWN_HOSTS, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        fail("Trusted SSH host key missing; run Configure SSH and verify the fingerprint first.")
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_size > 8192
+                or info.st_uid not in {0, os.geteuid()} or info.st_mode & 0o022):
+            fail("Pinned SSH host key file is unsafe; reconfigure the SSH endpoint.")
+        return os.read(fd, 8193)
+    finally:
+        os.close(fd)
+
+
+def current_enrollment_intent_unlocked() -> EnrollmentIntent:
+    """Caller holds manager lock; check consistent configuration and host pin."""
+    before = ssh_configuration_snapshot()
+    cfg = read_config()
+    host = read_pinned_host_record()
+    fingerprint = pinned_host_identity(cfg, host)
+    after = ssh_configuration_snapshot()
+    if before != after:
+        fail("SSH configuration changed while preparing enrollment; retry.")
+    return EnrollmentIntent(
+        remote_ip=cfg["remote_ip"], ssh_user=cfg["ssh_user"],
+        ssh_port=cfg["ssh_port"], identity_file=cfg["identity_file"],
+        host_record=host, host_fingerprint=fingerprint,
+        config_revision=after,
+    )
+
+
+def require_enrollment_intent_unlocked(intent: EnrollmentIntent) -> None:
+    """Never apply consent to another revision, destination, or host key."""
+    require_no_teardown()
+    if (read_json(STATE).get("status") != "DIRECT"
+            or not service_terminated() or any_proxy_tables()):
+        fail("Public-key enrollment requires verified DIRECT/OFF; inspect recovery.")
+    if (ssh_configuration_snapshot() != intent.config_revision
+            or current_enrollment_intent_unlocked() != intent):
+        fail("SSH destination, key or host identity changed after consent was prepared. "
+             "Nothing enrolled; reopen SSH Access and approve the current destination.")
+
+
+def enroll_public_key(intent: EnrollmentIntent | None = None) -> None:
+    """Opt-in enrollment bound to an immutable, independently pinned host key."""
+    require_root()
+    require_client_role()
+    require_no_teardown()
+    if intent is not None and not isinstance(intent, EnrollmentIntent):
+        fail("Invalid enrollment context; restart SSH setup.")
+    if intent is None:
+        with locked(wait_seconds=6):
+            require_no_teardown()
+            if (read_json(STATE).get("status") != "DIRECT"
+                    or not service_terminated() or any_proxy_tables()):
+                fail("Public-key enrollment requires verified DIRECT/OFF; inspect recovery.")
+            intent = current_enrollment_intent_unlocked()
+
+    helper = Path("/usr/bin/ssh-copy-id")
+    if not helper.is_file() or helper.is_symlink():
+        fail("ssh-copy-id unavailable. Install Debian openssh-client before enrolling.")
+    if "$" in intent.ssh_user:
+        fail("Public-key enrollment cannot safely use '$' in SSH usernames; "
+             "use a different remote account or the trusted console.")
+
+    say(f"Public key destination: {intent.ssh_user}@{intent.remote_ip}:{intent.ssh_port}", "INFO")
+    say(f"SSH private identity: {intent.identity_file}", "INFO")
+    say(f"Independently pinned remote ED25519: {intent.host_fingerprint}", "INFO")
+    say("Only the corresponding PUBLIC key will be installed; no network interception.", "WARN")
+    if not yes_no(f"Authorize public-key enrollment on {intent.ssh_user}@{intent.remote_ip}:{intent.ssh_port}?"):
+        say("Public-key enrollment cancelled. No remote action taken.", "INFO")
+        return
+
+    # The consent prompt and all remote/password I/O occur without the lock.
+    with locked(wait_seconds=6):
+        require_enrollment_intent_unlocked(intent)
+
+    key = private_key_path(intent.identity_file)
+    pub = validated_public_key(key)
+    expected_record = read_public_key_record(pub)
+
+    # ssh-copy-id is a shell helper and reads files by pathname. Publish a
+    # temporary operator-private snapshot: its -i input, matching private
+    # identity, and verified known_hosts cannot be retargeted by a concurrent
+    # Configure SSH session after the manager lock is released.
+    with tempfile.TemporaryDirectory(prefix="sc-enroll-", dir=key.parent) as directory:
+        staged_dir = Path(directory)
+        trusted_key_parents(staged_dir)
+        staged_key = staged_dir / "identity"
+        staged_pub = staged_dir / "identity.pub"
+        staged_hosts = staged_dir / "known_hosts"
+        os.link(key, staged_key, follow_symlinks=False)
+        private_key_path(str(staged_key))
+        derived = run(["ssh-keygen", "-y", "-P", "", "-f", str(staged_key)], timeout=12)
+        if single_public_record(derived.stdout.encode("utf-8")) != expected_record:
+            fail("SSH private key changed before enrollment; no remote action taken.")
+        atomic_write(staged_pub, (" ".join(expected_record) + "\n").encode("ascii"), 0o644)
+        atomic_write(staged_hosts, intent.host_record, 0o600)
+        if read_public_key_record(staged_pub) != expected_record:
+            fail("Enrollment public key changed during preparation; refusing remote access.")
+        if pinned_host_identity({
+            "remote_ip": intent.remote_ip, "ssh_port": intent.ssh_port,
+        }, staged_hosts.read_bytes()) != intent.host_fingerprint:
+            fail("Pinned SSH host key changed during preparation; refusing remote access.")
+
+        # Final revision check immediately before the subprocess. If another
+        # configure commits after this check, command arguments still refer
+        # exclusively to this explicitly approved, immutable snapshot.
+        with locked(wait_seconds=6):
+            require_enrollment_intent_unlocked(intent)
+
+        say("Remote SSH may request the account password here; it is not stored.", "WARN")
+        cmd = [
+            str(helper), "-F", "/dev/null", "-i", str(staged_pub),
+            "-p", str(intent.ssh_port),
+            "-o", f"UserKnownHostsFile={staged_hosts}",
+            "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", "UpdateHostKeys=no",
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", "HostKeyAlgorithms=ssh-ed25519",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "ConnectTimeout=10",
+            f"{intent.ssh_user}@{intent.remote_ip}",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, timeout=180, check=False,
+                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+                     "HOME": "/root", "TERM": os.environ.get("TERM", "dumb")},
+            )
+        except subprocess.TimeoutExpired:
+            fail("Public-key enrollment timed out. Confirm SSH port, credentials and policy.")
+        if result.returncode:
+            fail(f"Public-key enrollment failed (ssh-copy-id exit {result.returncode}). "
+                 "Remote password login may be disabled; authorize the public key via its trusted console.")
+    say("Public-key enrollment finished. Run Test SSH to verify it.", "OK")
+
+
+
+def display_public_key() -> None:
+    require_root()
+    require_client_role()
+    cfg = read_config()
+    pub = validated_public_key(Path(cfg["identity_file"]))
+    say("PUBLIC key only (safe to paste into the remote account's authorized_keys):", "INFO")
+    print(pub.read_text().strip())
+
+
+def ssh_configuration_snapshot() -> tuple[bytes | None, ...]:
+    """Stable contents of all three owned SSH configuration files under lock."""
+    fingerprints = []
+    for path in (CONF, SSH_CONF, KNOWN_HOSTS):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            fingerprints.append(None)
+            continue
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+                fail(f"Unsafe SSH configuration file: {path}")
+            raw = os.read(fd, 65537)
+            fingerprints.append(hashlib.sha256(raw).digest())
+        finally:
+            os.close(fd)
+    return tuple(fingerprints)
 
 
 def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
@@ -584,27 +1118,31 @@ def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
     require_root()
     require_no_teardown()
     require_client_role()
-    if not service_terminated() or read_json(STATE).get("status") != "DIRECT" or any_proxy_tables():
-        fail("Switch OFF and complete recovery before changing the SSH endpoint.")
-    remote_ip = ask(remote_ip, "Remote public IPv4")
-    ssh_user = ask(ssh_user, "SSH username", "root")
-    try:
-        ssh_port = int(ask(str(ssh_port) if ssh_port else None, "SSH port", "22"))
-    except ValueError:
-        fail("SSH port must be an integer from 1 to 65535.")
-    identity_file = ask(identity_file, "Private key path", "/root/.ssh/id_ed25519")
+    with locked(wait_seconds=6):
+        if not service_terminated() or read_json(STATE).get("status") != "DIRECT" or any_proxy_tables():
+            fail("Switch OFF and complete recovery before changing the SSH endpoint.")
+        prior_ssh = ssh_configuration_snapshot()
+    interactive = (sys.stdin.isatty() and
+                   any(x is None for x in (remote_ip, ssh_user, ssh_port, identity_file, fingerprint)))
+    if interactive:
+        print(paint("Configure SSH - all actions stay OFF; enter b to cancel a field.", "heading"))
+    remote_ip = checked_field(remote_ip, "Remote public IPv4", None,
+                              lambda value: validate_ipv4(value, public=True))
+    ssh_user = checked_field(ssh_user, "SSH username", "root", valid_user)
+    ssh_port = checked_field(str(ssh_port) if ssh_port is not None else None,
+                             "SSH port", "22", valid_port)
+    identity_file = select_identity(identity_file)
     cfg = validate_config({
         "remote_ip": remote_ip, "ssh_user": ssh_user, "ssh_port": ssh_port,
         "identity_file": identity_file,
     })
-    ETC.mkdir(parents=True, exist_ok=True)
     response = run(["ssh-keyscan", "-4", "-T", "7", "-t", "ed25519",
                     "-p", str(cfg["ssh_port"]), cfg["remote_ip"]], timeout=15)
     keys = [line for line in response.stdout.splitlines()
             if line and not line.startswith("#") and len(line.split()) == 3
             and line.split()[1] == "ssh-ed25519"]
     if len(keys) != 1:
-        fail("Expected exactly one ED25519 host key; refusing ambiguous trust.")
+        fail("Expected exactly one ED25519 host key. Verify SSH port and remote sshd configuration.")
     with tempfile.TemporaryDirectory() as d:
         keyfile = Path(d) / "key"
         keyfile.write_text(keys[0] + "\n")
@@ -612,9 +1150,21 @@ def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
     if len(observed) < 2:
         fail("Could not read SSH host fingerprint.")
     actual = observed[1]
-    expected = ask(fingerprint, "Trusted remote ED25519 fingerprint (SHA256:...)")
-    if not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", expected) or expected != actual:
-        fail(f"Fingerprint mismatch. Observed {actual}. Verify via provider console; nothing saved.")
+    verified_host_record = (keys[0] + "\n").encode("ascii")
+    if pinned_host_identity(cfg, verified_host_record) != actual:
+        fail("Observed ED25519 fingerprint does not match the scanned host key; nothing saved.")
+    say(f"Observed remote ED25519: {actual} (not yet trusted).", "WARN")
+    print("  Obtain the trusted fingerprint from the REMOTE server console:")
+    print("  ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub")
+    while True:
+        expected = ask(fingerprint, "Trusted remote ED25519 fingerprint (SHA256:...)")
+        if re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", expected) and expected == actual:
+            break
+        if fingerprint is not None or not sys.stdin.isatty():
+            fail(f"Fingerprint mismatch. Observed {actual}; nothing saved.")
+        say("Fingerprint does not match. No SSH configuration was saved.", "ERROR")
+        if not yes_no("Retry fingerprint entry?", default=True):
+            fail("SSH fingerprint not approved; configuration cancelled.")
     host = cfg["remote_ip"]
     port = cfg["ssh_port"]
     sshcfg = (
@@ -628,10 +1178,33 @@ def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
         "  ServerAliveInterval 10\n  ServerAliveCountMax 3\n"
         "  ClearAllForwardings yes\n"
     )
-    atomic_write(KNOWN_HOSTS, (keys[0] + "\n").encode())
-    atomic_write(SSH_CONF, sshcfg.encode())
-    write_json(CONF, cfg)
-    say("SSH identity pinned; configuration saved. Try 'simple-connect test' before ON.", "OK")
+    # Do not hold the manager lock across user input, ssh-keyscan or password
+    # prompts. Recheck the network state under the lock immediately before
+    # changing owned SSH configuration, then release it before enrollment.
+    with locked(wait_seconds=6):
+        require_no_teardown()
+        if not service_terminated() or read_json(STATE).get("status") != "DIRECT" or any_proxy_tables():
+            fail("Network state changed during SSH setup; no configuration saved.")
+        if ssh_configuration_snapshot() != prior_ssh:
+            fail("SSH configuration changed during setup by another session. No changes saved; restart Configure SSH.")
+        ETC.mkdir(parents=True, exist_ok=True)
+        atomic_write(KNOWN_HOSTS, verified_host_record)
+        atomic_write(SSH_CONF, sshcfg.encode())
+        write_json(CONF, cfg)
+        # Capture A while holding the commit lock, before another operator
+        # can configure B. Consent must never be rebound to current globals.
+        enrollment_intent = EnrollmentIntent(
+            remote_ip=cfg["remote_ip"], ssh_user=cfg["ssh_user"],
+            ssh_port=cfg["ssh_port"], identity_file=cfg["identity_file"],
+            host_record=verified_host_record, host_fingerprint=actual,
+            config_revision=ssh_configuration_snapshot(),
+        )
+    say("Remote identity pinned and configuration saved. Network remains DIRECT/OFF.", "OK")
+    if interactive:
+        enroll_public_key(enrollment_intent)
+        if yes_no("Test the remote SSH login and Python prerequisites now?", default=True):
+            remote_python_test()
+        say("Use Test HTTPS for full traffic checks before considering ON.", "INFO")
 
 
 def read_config() -> dict:
@@ -1251,11 +1824,15 @@ def status() -> None:
     print(f"Simple Connect: {VERSION}")
     role = (ETC / "role").read_text().strip().upper() if (ETC / "role").is_file() else "NOT SET UP"
     print(f"Role: {role}")
-    print(f"State: {state.get('status', 'UNKNOWN')}")
-    print(f"Proxy service: {'running' if is_active(SERVICE) else 'stopped'}")
+    label = str(state.get("status", "UNKNOWN"))
+    tone = "good" if label in ("DIRECT", "ACTIVE") else "warn" if label == "PENDING" else "error"
+    print(f"State: {paint(label, tone)}")
+    active = is_active(SERVICE)
+    print(f"Proxy service: {paint('running' if active else 'stopped', 'warn' if active else 'good')}")
     if state.get("status") != "DIRECT":
         print(f"Proxy listener port: {proxy_port(state)}")
-    print(f"Independent guard: {'running' if is_active(GUARD_TIMER) else 'not active'}")
+    guard_active = is_active(GUARD_TIMER)
+    print(f"Independent guard: {paint('running' if guard_active else 'not active', 'good' if guard_active else 'warn')}")
     table = current_table(state) if shutil.which("nft") and state.get("status") != "DIRECT" else None
     print(f"Owned nftables table: {'present' if table else 'absent'}")
     if state.get("status") == "DIRECT" and shutil.which("nft") and any_proxy_tables():
@@ -1539,29 +2116,214 @@ def uninstall(yes: bool) -> None:
     say("Owned resources removed; SSH, foreign firewall rules and routes unchanged.", "OK")
 
 
-def menu() -> None:
-    while True:
-        banner()
-        print("  1) Setup remote SERVER      2) Setup Iran CLIENT")
-        print("  3) Configure SSH endpoint   4) Turn ON")
-        print("  5) Confirm ON (new SSH)     6) Turn OFF")
-        print("  7) Status                   8) Test HTTPS")
-        print("  9) Logs                    10) Uninstall")
-        print("  0) Exit\n")
-        choice = input("Choose: ").strip()
+def clear_menu() -> None:
+    if (sys.stdout.isatty()
+            and os.environ.get("TERM", "") not in ("", "dumb")):
+        print("\033[2J\033[H", end="", flush=True)
+
+
+def menu_snapshot() -> dict[str, str]:
+    """A read-only, fail-explanatory snapshot; no route or firewall changes."""
+    result = {"role": "NOT INSTALLED", "state": "NOT INSTALLED",
+              "service": "n/a", "guard": "n/a", "remote": "NOT CONFIGURED",
+              "key": "NOT CONFIGURED", "note": "", "local": "UNKNOWN"}
+    role_path = ETC / "role"
+    try:
+        if role_path.is_symlink():
+            raise ConnectError("Unsafe role path (symlink).")
+        if role_path.is_file():
+            result["role"] = role_path.read_text().strip().upper()
+            if result["role"] not in ("CLIENT", "SERVER"):
+                raise ConnectError("Unrecognized role; do not change host networking.")
+    except (OSError, ConnectError) as exc:
+        result["role"] = "UNKNOWN"
+        result["note"] = str(exc)
+
+    if result["role"] == "SERVER":
+        result["state"] = "SSH SERVER (no tunnel)"
+        result["remote"] = "n/a (SSH endpoint)"
+        result["key"] = "n/a (managed by SSH server)"
         try:
+            result["service"] = "RUNNING" if is_active("ssh.service") or is_active("sshd.service") else "NOT ACTIVE"
+        except (OSError, subprocess.TimeoutExpired):
+            result["service"] = "UNKNOWN"
+        result["guard"] = "n/a"
+    if result["role"] == "CLIENT":
+        try:
+            state = read_json(STATE)
+            result["state"] = str(state.get("status", "UNKNOWN"))
+            if result["state"] not in ("DIRECT", "INSTALLING", "PENDING", "ACTIVE", "STOPPING", "UNCERTAIN"):
+                raise ConnectError("Unrecognized state marker; inspect state and recovery before ON.")
+            if result["state"] == "PENDING":
+                result["note"] = "New, independently authenticated SSH connection needed to Confirm."
+            if result["state"] == "UNCERTAIN":
+                result["note"] = "Manual recovery required; do NOT start another tunnel."
+        except (ConnectError, OSError) as exc:
+            result["state"] = "UNKNOWN"
+            result["note"] = str(exc)
+        for field, unit in (("service", SERVICE), ("guard", GUARD_TIMER)):
+            try:
+                result[field] = "RUNNING" if is_active(unit) else "STOPPED"
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                result[field] = "UNKNOWN"
+                result["note"] = str(exc)
+        if result["state"] == "DIRECT" and result["service"] == "RUNNING":
+            result["note"] = "State says DIRECT but proxy service runs: investigate before ON."
+        if result["state"] in ("ACTIVE", "PENDING") and result["service"] != "RUNNING":
+            result["note"] = "Proxy state and systemd service disagree; inspect recovery before ON."
+        if result["state"] in ("ACTIVE", "PENDING") and result["guard"] != "RUNNING":
+            result["note"] = "Independent guard unavailable. Investigate before ON."
+        try:
+            if not shutil.which("nft"):
+                if result["state"] in ("ACTIVE", "PENDING", "DIRECT") and not result["note"]:
+                    result["note"] = "nftables command unavailable; firewall state not verified."
+            else:
+                state_detail = read_json(STATE, {"status": "UNKNOWN"})
+                if result["state"] == "DIRECT" and any_proxy_tables():
+                    result["note"] = "Intercepting nftables rules exist despite DIRECT state; inspect recovery."
+                elif result["state"] in ("ACTIVE", "PENDING"):
+                    table = current_table(state_detail)
+                    fingerprint = state_detail.get("table_sha256")
+                    if table is None or not fingerprint or not table_is_ours(table, fingerprint):
+                        result["note"] = "Tunnel nftables ownership/identity not verified; inspect recovery."
+        except (ConnectError, OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            result["note"] = f"Unable to verify firewall state: {exc}"
+        try:
+            if result["state"] in ("ACTIVE", "PENDING") and not (CONF.exists() or CONF.is_symlink()):
+                result["note"] = "Tunnel state present but SSH configuration missing; inspect recovery."
+            if CONF.exists() or CONF.is_symlink():
+                cfg = read_json(CONF)
+                user = valid_user(str(cfg.get("ssh_user", "")))
+                ip = validate_ipv4(str(cfg.get("remote_ip", "")), public=True)
+                port = valid_port(str(cfg.get("ssh_port", "")))
+                result["remote"] = f"{user}@{ip}:{port}"
+                path = cfg.get("identity_file")
+                if isinstance(path, str):
+                    try:
+                        private_key_path(path)
+                        result["key"] = f"PRESENT: {path} (login untested)"
+                    except (ConnectError, OSError):
+                        result["key"] = "MISSING/UNSAFE"
+                else:
+                    result["key"] = "MISSING/UNSAFE"
+        except (ConnectError, OSError, ValueError) as exc:
+            result["remote"] = "INVALID CONFIG"
+            result["key"] = "UNKNOWN"
+            result["note"] = str(exc)
+
+    try:
+        p = subprocess.run(["ip", "-j", "-4", "address", "show", "scope", "global"],
+                           text=True, capture_output=True, timeout=2)
+        if p.returncode == 0:
+            for nic in json.loads(p.stdout):
+                for item in nic.get("addr_info", []):
+                    if item.get("family") == "inet" and item.get("local"):
+                        result["local"] = f"{item['local']} ({nic.get('ifname', '?')})"
+                        return result
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
+        pass
+    return result
+
+
+def menu_header(section: str = "MAIN MENU") -> None:
+    width = max(38, min(88, shutil.get_terminal_size(fallback=(80, 24)).columns - 1))
+    line = "-" * width
+    info = menu_snapshot()
+    state = info["state"]
+    state_tone = ("good" if state in ("DIRECT", "ACTIVE", "SSH SERVER (no tunnel)") and not info["note"]
+                  else "warn" if state in ("PENDING", "NOT INSTALLED") and not info["note"]
+                  else "error")
+    print(paint("=" * width, "title"))
+    print(f"  {paint('SIMPLE CONNECT', 'title')}  v{VERSION}   |   {paint(section, 'heading')}")
+    print(paint(line, "muted"))
+    print(f"  Role: {paint(info['role'], 'heading')}     Local IPv4: {info['local']}")
+    print(f"  Link: {paint(state, state_tone)}    Service: {info['service']}    Guard: {info['guard']}")
+    has_remote = info["role"] == "CLIENT" and info["remote"] not in ("NOT CONFIGURED", "INVALID CONFIG")
+    key_ready = info["key"].startswith("PRESENT: ")
+    configured = "READY (login untested)" if has_remote and key_ready else "INCOMPLETE" if has_remote else "NO"
+    print(f"  SSH configured: {paint(configured, 'good' if has_remote and key_ready else 'warn')}")
+    print(f"  Remote SSH: {info['remote']}")
+    key_tone = ("good" if info["key"].startswith("PRESENT: ") else
+                "warn" if info["key"] in ("NOT CONFIGURED", "n/a (managed by SSH server)") else
+                "error")
+    print(f"  Identity: {paint(info['key'], key_tone)}")
+    if info["note"]:
+        print(f"  {paint('ATTENTION:', 'error')} {info['note'][:max(18, width - 16)]}")
+    print(paint(line, "muted"))
+
+
+def pause_menu() -> None:
+    try:
+        input(f"\n{paint('Press Enter to return to the menu...', 'muted')}")
+    except (KeyboardInterrupt, EOFError):
+        pass
+
+
+def ssh_access_menu() -> None:
+    while True:
+        clear_menu()
+        menu_header("SSH ACCESS")
+        print("  1) Install selected PUBLIC key on remote account (SSH password may be needed)")
+        print("  2) Show PUBLIC key for provider-console enrollment")
+        print("  3) Test authenticated remote SSH / Python")
+        print("  4) Configure remote endpoint / create or choose key")
+        print("  0) Back to main menu\n")
+        try:
+            choice = input(f"{paint('Choose', 'heading')}: ").strip()
             if choice == "0":
                 return
             if choice == "1":
-                setup("server", WHEEL_URL)
+                enroll_public_key()
             elif choice == "2":
-                setup("client", WHEEL_URL)
+                display_public_key()
+            elif choice == "3":
+                remote_python_test()
+            elif choice == "4":
+                configure(None, None, None, None, None)
+            else:
+                say("Invalid choice. Select 0..4.", "WARN")
+        except (ConnectError, OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            show_error(exc)
+        except (KeyboardInterrupt, EOFError):
+            say("SSH access operation cancelled; returning to main menu.", "WARN")
+            return
+        pause_menu()
+
+
+def menu() -> None:
+    if not sys.stdin.isatty():
+        fail("Interactive menu requires a terminal (TTY). Use documented CLI subcommands for automation.")
+    while True:
+        clear_menu()
+        menu_header()
+        print(f"  {paint('SETUP', 'heading')}")
+        print("   1) Setup remote SERVER       2) Setup Iran CLIENT")
+        print("   3) Configure SSH connection 11) SSH keys / access")
+        print(f"  {paint('CONNECTION', 'heading')}")
+        print(f"   4) {paint('Turn ON', 'warn')} (requires field approval)  5) Confirm ON (fresh SSH)")
+        print(f"   6) {paint('Turn OFF', 'good')}")
+        print(f"  {paint('DIAGNOSTICS', 'heading')}")
+        print("   7) Status                    8) Test SSH + HTTPS")
+        print(f"   9) Logs                     10) {paint('Uninstall', 'error')} (destructive)")
+        print("   0) Exit\n")
+        try:
+            choice = input(f"{paint('Choose', 'heading')}: ").strip()
+            if choice == "0":
+                return
+            if choice == "1":
+                with locked(wait_seconds=6):
+                    setup("server", WHEEL_URL)
+            elif choice == "2":
+                with locked(wait_seconds=6):
+                    setup("client", WHEEL_URL)
+                if not CONF.exists():
+                    say("Client is DIRECT/OFF. Choose Configure SSH (3) for guided onboarding.", "INFO")
             elif choice == "3":
                 configure(None, None, None, None, None)
             elif choice == "4":
                 start_proxy()
             elif choice == "5":
-                confirm(input("Operation ID: ").strip())
+                confirm(input("Operation ID from PENDING state: ").strip())
             elif choice == "6":
                 stop_proxy()
             elif choice == "7":
@@ -1572,11 +2334,19 @@ def menu() -> None:
                 logs()
             elif choice == "10":
                 uninstall(input("Type YES to uninstall: ").strip() == "YES")
+            elif choice == "11":
+                ssh_access_menu()
+                continue
             else:
-                say("Unknown menu option.", "WARN")
-        except ConnectError as exc:
-            say(str(exc), "ERROR")
-        input("\nPress Enter to continue...")
+                say("Invalid option. Choose one of the numbered menu entries.", "WARN")
+        except (ConnectError, OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            show_error(exc)
+        except KeyboardInterrupt:
+            say("Operation interrupted. If networking had begun changing, inspect Status before retrying.", "WARN")
+        except EOFError:
+            say("Input ended; leaving the interactive menu.", "WARN")
+            return
+        pause_menu()
 
 
 def main() -> int:
@@ -1604,13 +2374,12 @@ def main() -> int:
         if args.action is None:
             menu()
         elif args.action == "setup":
-            # The periodic guard may momentarily own the state lock.
-            # Wait briefly instead of reporting an avoidable install error.
+            # Installation does not launch an error-prone wizard: the bootstrap
+            # opens the persistent menu on the same TTY after setup succeeds.
             with locked(wait_seconds=6):
                 setup(args.role, args.wheel_url)
         elif args.action == "configure":
-            with locked(wait_seconds=6):
-                configure(args.remote_ip, args.ssh_user, args.ssh_port, args.identity_file, args.fingerprint)
+            configure(args.remote_ip, args.ssh_user, args.ssh_port, args.identity_file, args.fingerprint)
         elif args.action == "on":
             start_proxy()
         elif args.action == "off":
@@ -1633,10 +2402,16 @@ def main() -> int:
             service_run()
         return 0
     except ConnectError as exc:
-        say(str(exc), "ERROR")
+        show_error(exc)
         return 1
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        say(f"System operation failed: {type(exc).__name__}: {exc}", "ERROR")
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        show_error(exc)
+        return 1
+    except KeyboardInterrupt:
+        say("Interrupted. Inspect Status before retrying any in-progress networking action.", "WARN")
+        return 130
+    except EOFError:
+        say("Interactive input ended. Use explicit CLI flags for automation.", "WARN")
         return 1
 
 

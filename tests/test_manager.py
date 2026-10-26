@@ -675,14 +675,20 @@ class SimpleConnectTests(unittest.TestCase):
                                     sc.guarded_check()
                                     stop.assert_called_once_with("guard")
 
-    def test_operator_setup_and_configure_wait_for_guard_lock(self):
-        for action, command in (("setup",["simple_connect.py","setup","client"]),
-                                ("configure",["simple_connect.py","configure"])):
-            with self.subTest(action=action):
-                with patch.object(sys,"argv",command),patch.object(sc,"locked",return_value=nullcontext()) as gate:
-                    with patch.object(sc,action):
-                        self.assertEqual(sc.main(),0)
-                    gate.assert_called_once_with(wait_seconds=6)
+    def test_cli_setup_holds_lock_but_configure_manages_its_own_short_locks(self):
+        with patch.object(sys, "argv", ["simple_connect.py", "setup", "server"]), (
+             patch.object(sc, "locked", return_value=nullcontext())) as gate, (
+             patch.object(sc, "setup")):
+            self.assertEqual(sc.main(), 0)
+            gate.assert_called_once_with(wait_seconds=6)
+
+        # No lock may be held while interactive SSH/password prompts run.
+        with patch.object(sys, "argv", ["simple_connect.py", "configure"]), (
+             patch.object(sc, "locked", return_value=nullcontext())) as gate, (
+             patch.object(sc, "configure")) as configure:
+            self.assertEqual(sc.main(), 0)
+            gate.assert_not_called()
+            configure.assert_called_once_with(None, None, None, None, None)
 
     def test_late_uninstall_is_resumable_after_each_crash_window(self):
         # The same verified-manager function is used on the resumed call.
