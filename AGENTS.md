@@ -1,0 +1,15 @@
+# Simple Connect — engineering and safety boundaries
+
+- Single repo owner: AChWorks/simple-connect. Do not modify Server Connect or SSH/host networks from this project without exact separate authorization.
+- Keep this utility intentionally small: one Python standard-library manager, one verified Bash bootstrap, one mirror packaging script, direct upstream sshuttle. No speculative core/provider framework.
+- The selected target is Debian 13 amd64, systemd and nftables; do not silently claim other Linux/IPv6/container support.
+- Never select a remote endpoint or create SSH users, passwords or private keys without operator authorization. Pin SSH host key identity out-of-band.
+- SSH tunnel service defaults OFF after reboot. Preserve existing SSH, aaPanel and website reply paths; support only owned nftables cleanup and independent recovery. Ambiguous ownership must be surfaced, never flush/firewall-reset.
+- Updating simple_connect.py requires updating the exact pinned MANAGER_SHA256 in install.sh in the **same candidate**. The fixed HTTPS mirror is https://helpe.ir/simple-connect/ and may be selected using --mirror. The wheel's immutable upstream digest must be validated for original and independent mirror.
+- Run hermetic tests, real disposable isolated-host regression and a fresh author-separated HIGH_ASSURANCE independent review before merging privileged network code. Real hosting installation/activation needs a separate explicit rollout and recovery approval.
+- Source/PR/CI are truth for candidate state; README documents stable usage and truthful limitations. No chat-dependent state or speculative release claims.
+
+- Owner-approved minimal main protection: Pull Request and source-and-mirror CI required, zero GitHub approving reviewers (independent author-separated HIGH_ASSURANCE review is user-mediated and remains an integration gate). Always recheck effective branch policy before merge; do not add mandatory GitHub Reviewer approvals without explicit Owner instruction.
+- A stopped process is a prerequisite to claiming DIRECT or deleting an owned firewall table. Early tables without a persisted exact hash are UNKNOWN/UNCERTAIN, even if they resemble the upstream sshuttle rules. Preserve the operator's network ownership.
+- Fresh SSH confirmation requires a post-activation SSH kernel-socket identity absent from the saved post-activation baseline, a non-local peer, and same-boot CLOCK_BOOTTIME deadline. Never use editable SSH_CONNECTION for the proof.
+- INSTALLING means never activated and may be retried only with verified no-proxy/no-firewall state; UNCERTAIN remains fail-closed. Uninstall has a durable, monotonic phase checkpoint and blocks concurrent lifecycle operations. Resume must tolerate deliberately deleted role/state/executable and missing unit files only after the proven completed phase; verify service/timer/nft and foreign-unit ownership before deleting more. The final empty-directory window can be completed by the verified manager. Never treat missing state alone as proof of safe teardown.
