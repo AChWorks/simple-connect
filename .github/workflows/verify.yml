@@ -23,3 +23,14 @@ jobs:
           set -euo pipefail
           bash scripts/build-mirror-bundle.sh
           (cd dist/simple-connect-mirror && sha256sum -c SHA256SUMS)
+      - name: Stage exact 4-file owner-upload mirror artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: simple-connect-mirror
+          path: |
+            dist/simple-connect-mirror/install.sh
+            dist/simple-connect-mirror/simple_connect.py
+            dist/simple-connect-mirror/sshuttle-2.0.0-py3-none-any.whl
+            dist/simple-connect-mirror/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14

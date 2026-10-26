@@ -320,6 +320,9 @@ ExecStopPost=-{cmd} recover
 Restart=no
 TimeoutStartSec=50
 TimeoutStopSec=15
+# Stop upstream without its unconditional "delete entire table" destructor.
+# Our independent recovery removes ONLY an identity-verified owned table.
+KillSignal=SIGKILL
 KillMode=control-group
 
 [Install]
@@ -489,9 +492,39 @@ def boot_id() -> str:
     return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
 
 
-def current_table() -> dict | None:
+def proxy_port(state: dict | None = None) -> int:
+    if state is None:
+        state = read_json(STATE, {"status": "DIRECT"})
+    port = state.get("listen_port", PORT)
+    if type(port) is not int or not (13000 <= port <= 61000):
+        fail("Invalid stored proxy listener port; refusing to touch firewall.")
+    return port
+
+
+def proxy_table(state: dict | None = None) -> str:
+    return f"sshuttle-ipv4-{proxy_port(state)}"
+
+
+def choose_port() -> int:
+    # sshuttle 2.0.0 does not set SO_REUSEADDR. Reusing a recent fixed
+    # listening port fails with EADDRINUSE while its accepted TCP sockets
+    # remain in TIME_WAIT. A new distinct port fixes fast ON/OFF cycles.
+    for _ in range(32):
+        port = 20000 + secrets.randbelow(28000)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        if current_table({"listen_port": port}) is None:
+            return port
+    fail("Could not allocate an available proxy port; no network changes made.")
+
+
+def current_table(state: dict | None = None) -> dict | None:
+    name = proxy_table(state)
     proc = subprocess.run(
-        ["nft", "-j", "list", "table", "ip", TABLE],
+        ["nft", "-j", "list", "table", "inet", name],
         text=True, capture_output=True, timeout=8,
     )
     if proc.returncode != 0:
@@ -525,16 +558,130 @@ def ensure_stopped() -> None:
         fail(f"State is {state.get('status', 'UNKNOWN')}. Run off/recover before ON.")
 
 
+def safe_early_sshuttle_table(table: dict, state: dict) -> bool:
+    """Recognize only the complete, unmodified sshuttle 2.0.0 nft footprint.
+
+    If the daemon crashes between rule installation and the durable table
+    fingerprint, an exact shape permits narrow rollback. Earlier incomplete
+    setup without an installed redirect stays UNCERTAIN, not an unsafe flush.
+    """
+    if state.get("status") not in ("PENDING", "STOPPING") or state.get("boot") != boot_id():
+        return False
+    if state.get("table_sha256"):
+        return False
+    name = proxy_table(state)
+    port = proxy_port(state)
+    data = table.get("nftables")
+    if not isinstance(data, list) or not data or len(data) > 80:
+        return False
+    allowed = {str(ipaddress.ip_network(x, strict=False)) for x in EXCLUDED}
+    for ip in (state.get("remote_ip"), state.get("management_ip"), "127.0.0.1"):
+        try:
+            allowed.add(str(ipaddress.ip_network(str(ip) + "/32", strict=False)))
+        except ValueError:
+            return False
+    chains = set()
+    jumps = set()
+    table_count = 0
+    found = {"proto": False, "fib": False, "tcp": False}
+    def ip_match(value):
+        try:
+            if isinstance(value, dict):
+                p = value["prefix"]
+                return str(ipaddress.ip_network(f'{p["addr"]}/{p["len"]}', strict=False))
+            return str(ipaddress.ip_network(str(value) + "/32", strict=False))
+        except (KeyError, TypeError, ValueError):
+            return None
+    for item in data:
+        if not isinstance(item, dict) or len(item) != 1:
+            return False
+        kind, entry = next(iter(item.items()))
+        if kind == "metainfo":
+            continue
+        if not isinstance(entry, dict) or entry.get("family") != "inet":
+            return False
+        if kind == "table" and entry.get("name") != name:
+            return False
+        if kind not in ("table", "metainfo") and entry.get("table") != name:
+            return False
+        if kind == "table":
+            if set(entry) != {"family", "name", "handle"} or not isinstance(entry["handle"], int):
+                return False
+            table_count += 1
+            continue
+        if kind == "chain":
+            if not isinstance(entry.get("handle"), int):
+                return False
+            ch = entry.get("name")
+            if ch in ("output", "prerouting"):
+                if set(entry) != {"family", "table", "name", "handle", "type", "hook", "prio", "policy"}:
+                    return False
+                if (entry["type"], entry["hook"], entry["prio"], entry["policy"]) != ("nat", ch, -100, "accept"):
+                    return False
+            elif ch == name:
+                if set(entry) != {"family", "table", "name", "handle"}:
+                    return False
+            else:
+                return False
+            chains.add(ch)
+            continue
+        if kind != "rule" or set(entry) != {"family", "table", "chain", "handle", "expr"}:
+            return False
+        if not isinstance(entry["handle"], int) or not isinstance(entry["expr"], list):
+            return False
+        ch = entry["chain"]
+        expr = entry["expr"]
+        if any(not isinstance(element, dict) for element in expr):
+            return False
+        if ch in ("output", "prerouting"):
+            if expr != [{"jump": {"target": name}}]:
+                return False
+            jumps.add(ch)
+            continue
+        if ch != name:
+            return False
+        if expr == [{"match": {"op": "!=", "left": {"meta": {"key": "nfproto"}}, "right": "ipv4"}}, {"return": None}]:
+            found["proto"] = True
+        elif expr == [{"match": {"op": "==", "left": {"fib": {"result": "type", "flags": ["daddr"]}}, "right": "local"}}, {"return": None}]:
+            found["fib"] = True
+        elif len(expr) == 3 and expr[0] == {"match": {"op": "==", "left": {"meta": {"key": "l4proto"}}, "right": "tcp"}} and expr[1].get("match", {}).get("left") == {"payload": {"protocol": "ip", "field": "daddr"}}:
+            address = ip_match(expr[1]["match"].get("right"))
+            if expr[1]["match"].get("op") != "==":
+                return False
+            if expr[2] == {"return": None} and address in allowed:
+                pass
+            elif expr[2] == {"redirect": {"port": port}} and address == "0.0.0.0/0":
+                found["tcp"] = True
+            else:
+                return False
+        elif len(expr) == 3 and expr[0].get("match", {}).get("left") == {"payload": {"protocol": "ip", "field": "daddr"}} and expr[1] == {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 53}}:
+            target = expr[0]["match"].get("right")
+            redirect = expr[2].get("redirect", {})
+            if expr[0]["match"].get("op") != "==" or not isinstance(target, str) or not isinstance(redirect, dict):
+                return False
+            try:
+                ipaddress.IPv4Address(target)
+            except ValueError:
+                return False
+            if set(redirect) != {"port"} or type(redirect["port"]) is not int or not (9000 <= redirect["port"] <= 12300):
+                return False
+        else:
+            return False
+    return table_count == 1 and chains == {"output", "prerouting", name} and jumps == {"output", "prerouting"} and all(found.values())
+
+
 def owned_cleanup(state: dict) -> bool:
-    table = current_table()
+    table = current_table(state)
     if table is None:
         return True
     expected = state.get("table_sha256", "")
-    if not isinstance(expected, str) or not table_is_ours(table, expected):
-        say(f"UNCERTAIN: nftables table {TABLE} differs from recorded owned state. Manual inspection needed.", "ERROR")
+    if not isinstance(expected, str) or not (
+        table_is_ours(table, expected) or (not expected and safe_early_sshuttle_table(table, state))
+    ):
+        say(f"UNCERTAIN: nftables table {proxy_table(state)} differs from recorded owned state. Manual inspection needed.", "ERROR")
         return False
-    run(["nft", "delete", "table", "ip", TABLE], timeout=10)
-    return current_table() is None
+    run(["nft", "delete", "table", "inet", proxy_table(state)], timeout=10)
+    return current_table(state) is None
 
 
 def reconcile(reason: str) -> None:
@@ -557,29 +704,38 @@ def start_proxy() -> None:
         ssh_conn = initial_ssh_connection()
         remote_python_test()
         op = secrets.token_hex(8)
+        port = choose_port()
         state = {
             "status": "PENDING", "op": op, "boot": boot_id(),
             "started": int(time.time()), "deadline": int(time.time()) + 600,
             "original_ssh_connection": ssh_conn, "management_ip": ssh_conn.split()[0],
-            "remote_ip": cfg["remote_ip"], "table_sha256": "",
+            "remote_ip": cfg["remote_ip"], "listen_port": port, "table_sha256": "",
         }
         write_json(STATE, state)
-        try:
-            unit_action("start", SERVICE)
+    # Never hold the manager lock during systemd's start/stop transactions.
+    # ExecStopPost and the independent guard need that same lock to recover.
+    try:
+        unit_action("start", SERVICE)
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and current_table() is None and is_active(SERVICE):
+            time.sleep(0.2)
+        with locked():
+            observed = read_json(STATE)
+            if observed.get("op") != op or observed.get("status") != "PENDING":
+                fail("Activation changed concurrently; refusing to commit firewall identity.")
             if not is_active(SERVICE):
                 fail("sshuttle service did not enter ACTIVE state.")
             table = current_table()
             if table is None:
                 fail("No expected nftables table after sshuttle startup.")
-            state["table_sha256"] = table_hash(table)
-            write_json(STATE, state)
-        except Exception:
-            subprocess.run(["systemctl", "stop", SERVICE], timeout=30)
-            try:
+            observed["table_sha256"] = table_hash(table)
+            write_json(STATE, observed)
+    except Exception:
+        subprocess.run(["systemctl", "stop", SERVICE], timeout=30, check=False)
+        with locked():
+            if read_json(STATE, {"status": "DIRECT"}).get("status") != "DIRECT":
                 reconcile("failed_activation")
-            except ConnectError:
-                pass
-            raise
+        raise
     say(f"Proxy started in PENDING state; automatic rollback deadline ~10 minutes. Operation: {op}", "WARN")
     say(f"From a NEW authenticated SSH session, run: sudo simple-connect confirm {op}")
 
@@ -668,7 +824,7 @@ def service_run() -> None:
     excluded = list(EXCLUDED) + [cfg["remote_ip"] + "/32", str(state["management_ip"]) + "/32"]
     argv = [
         "/usr/bin/python3", "-m", "sshuttle", "--method=nft", "--dns",
-        "--listen", f"127.0.0.1:{PORT}", "--remote", "sc-remote",
+        "--listen", f"127.0.0.1:{proxy_port(state)}", "--remote", "sc-remote",
         "--ssh-cmd", f"ssh -F {SSH_CONF} -o BatchMode=yes",
     ]
     for cidr in excluded:
@@ -685,6 +841,8 @@ def status() -> None:
     print(f"Role: {role}")
     print(f"State: {state.get('status', 'UNKNOWN')}")
     print(f"Proxy service: {'running' if is_active(SERVICE) else 'stopped'}")
+    if state.get("status") != "DIRECT":
+        print(f"Proxy listener port: {proxy_port(state)}")
     print(f"Independent guard: {'running' if is_active(GUARD_TIMER) else 'not active'}")
     table = current_table() if shutil.which("nft") else None
     print(f"Owned nftables table: {'present' if table else 'absent'}")
@@ -728,6 +886,19 @@ def uninstall(yes: bool) -> None:
     require_root()
     if not yes:
         fail("Uninstall destroys Simple Connect's private configuration. Use 'uninstall --yes'.")
+    role_path = ETC / "role"
+    if role_path.is_file() and role_path.read_text().strip() == "server":
+        # The remote role never installed nftables, a tunnel, or systemd
+        # service units. Do not require local nft tooling to uninstall.
+        if CONF.exists() or STATE.exists():
+            fail("Unexpected client state on SERVER role; refusing ambiguous cleanup.")
+        for path in (APP, COMMAND, role_path):
+            if path.is_file() and not path.is_symlink():
+                path.unlink()
+        if ETC.is_dir() and not any(ETC.iterdir()):
+            ETC.rmdir()
+        say("Server-side Simple Connect manager removed; existing SSH remains unchanged.", "OK")
+        return
     stop_proxy()
     if read_json(STATE, {"status": "DIRECT"}).get("status") != "DIRECT":
         fail("Recovery uncertain; refusing to uninstall with active or unknown firewall resources.")

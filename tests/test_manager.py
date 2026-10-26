@@ -39,6 +39,22 @@ class SimpleConnectTests(unittest.TestCase):
             with self.assertRaises(sc.ConnectError):
                 sc.read_json(p)
 
+    def test_nft_family_is_inet_in_real_upstream_2_0(self):
+        data = {"nftables":[{"metainfo":{"version":"1.1.3"}},
+                            {"table":{"family":"inet","name":"sshuttle-ipv4-21001","handle":1}}]}
+        proc = subprocess.CompletedProcess([], 0, json.dumps(data), "")
+        with patch.object(sc.subprocess, "run", return_value=proc) as call:
+            self.assertEqual(sc.current_table({"listen_port":21001}), data)
+            self.assertEqual(call.call_args.args[0], ["nft","-j","list","table","inet","sshuttle-ipv4-21001"])
+
+    def test_dynamic_port_avoids_recent_socket_reuse(self):
+        with patch.object(sc, "current_table", return_value=None):
+            port = sc.choose_port()
+        self.assertTrue(20000 <= port < 48000)
+        self.assertEqual(sc.proxy_table({"listen_port": port}), f"sshuttle-ipv4-{port}")
+        with self.assertRaises(sc.ConnectError):
+            sc.proxy_table({"listen_port": "bad"})
+
     def test_expected_nft_snapshot_stable_key_order(self):
         a = {"nftables": [{"table": {"family": "ip", "name": sc.TABLE}}, {"rule": {"chain": "output", "handle": 2}}]}
         b = {"nftables": [{"table": {"name": sc.TABLE, "family": "ip"}}, {"rule": {"handle": 2, "chain": "output"}}]}
@@ -58,12 +74,13 @@ class SimpleConnectTests(unittest.TestCase):
         sample = {"nftables": [{"table": {"family": "ip", "name": sc.TABLE}}]}
         with patch.object(sc, "current_table", side_effect=[sample, None]), patch.object(sc, "run") as command:
             self.assertTrue(sc.owned_cleanup({"table_sha256": sc.table_hash(sample)}))
-            command.assert_called_once_with(["nft", "delete", "table", "ip", sc.TABLE], timeout=10)
+            command.assert_called_once_with(["nft", "delete", "table", "inet", sc.TABLE], timeout=10)
 
     def test_guard_service_never_enabled_as_tunnel(self):
         units = sc.unit_texts()
         self.assertIn("BindsTo=simple-connect-guard.timer", units[sc.SERVICE])
         self.assertIn("ExecStopPost=", units[sc.SERVICE])
+        self.assertIn("KillSignal=SIGKILL", units[sc.SERVICE])
         self.assertIn("OnBootSec=12s", units[sc.GUARD_TIMER])
         self.assertNotIn("WantedBy=multi-user.target", units[sc.SERVICE])
 
@@ -134,6 +151,62 @@ class SimpleConnectTests(unittest.TestCase):
                         sc.guard()
                         stop.assert_called_once()
                         recovered.assert_called_once()
+
+    def test_early_crash_table_shape_rejects_modified_or_foreign_resources(self):
+        p = 24567
+        name = f"sshuttle-ipv4-{p}"
+        state = {"status": "PENDING", "boot": "test-boot", "listen_port": p,
+                 "remote_ip": "8.8.8.8", "management_ip": "9.9.9.9", "table_sha256": ""}
+        def entry(kind, **fields):
+            return {kind: fields}
+        common = {"family": "inet", "table": name}
+        proto = [{"match": {"op": "!=", "left": {"meta": {"key": "nfproto"}}, "right": "ipv4"}}, {"return": None}]
+        fib = [{"match": {"op": "==", "left": {"fib": {"result": "type", "flags": ["daddr"]}}, "right": "local"}}, {"return": None}]
+        tcp = [{"match": {"op": "==", "left": {"meta": {"key": "l4proto"}}, "right": "tcp"}},
+               {"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "daddr"}}, "right": {"prefix": {"addr": "0.0.0.0", "len": 0}}}},
+               {"redirect": {"port": p}}]
+        entries = [
+            entry("table", family="inet", name=name, handle=12),
+            entry("chain", **common, name="output", handle=1, type="nat", hook="output", prio=-100, policy="accept"),
+            entry("chain", **common, name="prerouting", handle=2, type="nat", hook="prerouting", prio=-100, policy="accept"),
+            entry("chain", **common, name=name, handle=3),
+            entry("rule", **common, chain="output", handle=4, expr=[{"jump": {"target": name}}]),
+            entry("rule", **common, chain="prerouting", handle=5, expr=[{"jump": {"target": name}}]),
+            entry("rule", **common, chain=name, handle=6, expr=proto),
+            entry("rule", **common, chain=name, handle=7, expr=fib),
+            entry("rule", **common, chain=name, handle=8, expr=tcp),
+        ]
+        with patch.object(sc, "boot_id", return_value="test-boot"):
+            self.assertTrue(sc.safe_early_sshuttle_table({"nftables": entries}, state))
+            import copy
+            changed = copy.deepcopy(entries)
+            changed[-1]["rule"]["expr"][2]["redirect"]["port"] = p+1
+            self.assertFalse(sc.safe_early_sshuttle_table({"nftables": changed}, state))
+            changed = copy.deepcopy(entries)
+            changed[1]["chain"]["prio"] = -99
+            self.assertFalse(sc.safe_early_sshuttle_table({"nftables": changed}, state))
+            changed = copy.deepcopy(entries)
+            changed.append(entry("rule", **common, chain=name, handle=9, expr=[{"accept": None}]))
+            self.assertFalse(sc.safe_early_sshuttle_table({"nftables": changed}, state))
+            self.assertFalse(sc.safe_early_sshuttle_table({"nftables": entries}, {**state,"status":"ACTIVE"}))
+
+    def test_server_uninstall_does_not_require_nft_or_client_service(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            etc = root / "etc"
+            etc.mkdir()
+            (etc / "role").write_text("server\n")
+            app = root / "manager.py"
+            cmd = root / "simple-connect"
+            app.write_text("manager")
+            cmd.write_text("wrapper")
+            with patch.object(sc, "ETC", etc), patch.object(sc, "APP", app), patch.object(sc, "COMMAND", cmd):
+                with patch.object(sc, "require_root"), patch.object(sc, "stop_proxy") as stop:
+                    sc.uninstall(True)
+                    stop.assert_not_called()
+            self.assertFalse(app.exists())
+            self.assertFalse(cmd.exists())
+            self.assertFalse(etc.exists())
 
     def test_bootstrap_hash_matches_manager(self):
         repo = Path(__file__).resolve().parents[1]

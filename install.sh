@@ -4,8 +4,9 @@ set -Eeuo pipefail
 umask 077
 readonly OFFICIAL_MANAGER="https://raw.githubusercontent.com/AChWorks/simple-connect/main/simple_connect.py"
 readonly OFFICIAL_WHEEL="https://files.pythonhosted.org/packages/25/1d/c409e26b9d5d26e6f07466c3d4662abb1c3ca4810424f66f38e1b5e54f33/sshuttle-2.0.0-py3-none-any.whl"
-readonly MANAGER_SHA256="5cd3557e92bcc388c3291514fc5569135dee673ce55ccf84d2be25056e980055"
+readonly MANAGER_SHA256="7986f786b6beb288cad9ea9f6e9b8c88b9801370a40c31874c58adb5a62f1c88"
 readonly WHEEL_SHA256="506a8cad2f047ca42f0d784654cb3459e2193bfad79d0a03734e0e07473f2bbb"
+readonly DEFAULT_MIRROR="https://helpe.ir/simple-connect"
 
 die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 info() { printf '[INFO] %s\n' "$*"; }
@@ -17,10 +18,15 @@ wheel_url=""
 while (($#)); do
     case "$1" in
         --role) (($# >= 2)) || die "Missing --role value"; role="$2"; shift 2 ;;
-        --mirror) (($# >= 2)) || die "Missing --mirror base URL"; mirror="$(printf '%s' "$2" | sed 's,/$,,')"; shift 2 ;;
+        --mirror)
+            if (($# >= 2)) && [[ "$2" == https://* ]]; then
+                mirror="$(printf '%s' "$2" | sed 's,/$,,')"; shift 2
+            else
+                mirror="$DEFAULT_MIRROR"; shift
+            fi ;;
         --wheel-url) (($# >= 2)) || die "Missing --wheel-url"; wheel_url="$2"; shift 2 ;;
         --help|-h)
-            printf 'Usage: install.sh [--role server|client] [--mirror HTTPS_BASE_URL] [--wheel-url HTTPS_URL]\n'
+            printf 'Usage: install.sh [--role server|client] [--mirror [HTTPS_BASE_URL]] [--wheel-url HTTPS_URL]\n'
             exit 0 ;;
         *) die "Unknown argument: $1" ;;
     esac

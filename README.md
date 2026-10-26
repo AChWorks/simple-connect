@@ -23,11 +23,20 @@ For unattended setup, append argument flags after the last pipe, such as:
 curl -fsSL https://raw.githubusercontent.com/AChWorks/simple-connect/main/install.sh | sudo bash -s -- --role client
 ~~~
 
-**Independent HTTPS mirror:** Upload the *identical bytes* of install.sh, simple_connect.py and sshuttle-2.0.0-py3-none-any.whl to a trusted non-GitHub HTTPS location. Example (placeholder, not a real deployed host):
+**Independent HTTPS mirror:** The configured mirror is
+https://helpe.ir/simple-connect/. Upload the **exact four files**
+install.sh, simple_connect.py, sshuttle-2.0.0-py3-none-any.whl,
+and SHA256SUMS directly into the website's public /simple-connect/ directory
+(no additional nested folder). When that HTTPS path serves the files correctly:
 
 ~~~bash
-curl -fsSL https://YOUR-TRUSTED-MIRROR.example/simple-connect/install.sh | sudo bash -s -- --mirror https://YOUR-TRUSTED-MIRROR.example/simple-connect
+curl -fsSL https://helpe.ir/simple-connect/install.sh | sudo bash -s -- --mirror
 ~~~
+
+For a different future mirror base URL, use --mirror https://other.example/path.
+The --mirror flag without a value selects the configured helpe.ir URL.
+Until the owner uploads these files, the site returns HTTP 404 and the
+mirror one-liner is not functional.
 
 The bootstrap verifies the manager's embedded pinned SHA-256. The manager independently verifies the official upstream wheel SHA-256 even when downloaded from the mirror. A malicious replacement of the **bootstrap itself** could also replace its checksum: trust the mirror or verify the bootstrap checksum against an authenticated independent source *before running it as root*. The build script below emits SHA256SUMS for independent comparison. Do not treat HTTPS or a self-supplied checksum alone as publisher authentication.
 
@@ -38,7 +47,7 @@ bash scripts/build-mirror-bundle.sh
 # Upload the contents of dist/simple-connect-mirror/ over your authenticated deployment path.
 ~~~
 
-The mirror domain and storage are a later owner choice. The example URL above is not runnable. Even with the mirror, operating-system apt prerequisites must be obtainable from a configured Debian/local mirror. The setup process only installs **missing** apt packages and never performs a blanket apt upgrade.
+The mirror hostname is owner-selected; its web-root storage and actual file deployment remain owner-managed. Even with the mirror, operating-system apt prerequisites must be obtainable from a configured Debian/local mirror. The setup process only installs **missing** apt packages and never performs a blanket apt upgrade.
 
 ## Configure and use
 
@@ -65,7 +74,7 @@ sudo simple-connect uninstall --yes
 
 The client stores its trusted SSH host key separately under /etc/simple-connect/known_hosts. SSH uses strict host-key verification, a single configured private key and connection keepalives. Existing global SSH settings and credentials are never rewritten.
 
-ON preflights the endpoint, requires an independent active systemd guard timer, refuses existing/foreign nftables tables with the intended name, starts sshuttle, and requires fresh-SSH confirmation within 600 seconds. The guard subsequently checks that the service and owned nftables table are still present and unchanged. Failure requests shutdown and cleanup of **only the recorded owned table**. On unknown provenance it reports UNCERTAIN rather than flushing somebody else's firewall.
+ON preflights the endpoint, requires an independent active systemd guard timer, refuses existing/foreign nftables tables with the intended name, starts sshuttle, and requires fresh-SSH confirmation within 600 seconds. The guard subsequently checks that the service and owned nftables table are still present and unchanged. A service stop uses systemd SIGKILL for sshuttle to suppress upstream's unconditional firewall-table destructor; the separate recovery operation instead checks the recorded table identity before deleting **only proven owned resources**. On unknown provenance it reports UNCERTAIN and stops redirector processing without flushing somebody else's rules. An interrupted activation before its table fingerprint is persisted is recoverable only when an exact narrowly recognized sshuttle 2.0.0 table shape is observed; every other ambiguous table remains UNCERTAIN.
 
 OFF restores Direct routing (which may still have blocked international downloads). The main proxy service is **not enabled at boot**; after reboot it defaults OFF and the independent timer checks an interrupted previous operation. Duplicate activation is rejected.
 
@@ -77,7 +86,7 @@ OFF restores Direct routing (which may still have blocked international download
 - No automatic proxy reconnection loop, no generic whole-host killswitch, no default-route changes, no global firewall flush. By default failure recovers the original Direct state, not necessarily foreign connectivity.
 - Initial target: Debian 13 amd64 with systemd, nftables, Python >=3.9 and working remote SSH. Other systems have not been accepted.
 - Pinned official sshuttle 2.0.0 is installed in /opt/simple-connect/sshuttle. It is not installed into global pip. Repeated setup skips a correct, verified installation.
-- IMPORTANT: The current fingerprint-based firewall cleanup cannot prove safe recovery for every crash timing, concurrent foreign rule edit, or reboot. More isolated guest/field verification and a fresh high-assurance independent review are required **before shipping or executing ON on real hosting**.
+- IMPORTANT: Actual disconnected Docker guest tests have verified normal ON/OFF, new-SSH confirmation, an unconfirmed deadline, SIGKILL, guard shutdown, concurrent foreign rule preservation, and a pending Docker PID1 restart. Those tests are **not** physical host/kernel reboot, mixed production firewall/conntrack acceptance, or proof of all possible partial network mutations. Full field evidence and fresh high-assurance independent review remain required **before shipping or executing ON on real hosting**.
 
 ## Development checks
 
