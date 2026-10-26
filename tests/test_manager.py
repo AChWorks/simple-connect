@@ -278,15 +278,20 @@ class SimpleConnectTests(unittest.TestCase):
                         stop.assert_called_once_with("guard")
 
     def test_uninstall_refuses_failed_shutdown_without_erasing_files(self):
-        from contextlib import nullcontext
-        with patch.object(sc,"require_root"),patch.object(sc,"require_client_role"):
-            with patch.object(sc,"locked",return_value=nullcontext()):
-                with patch.object(sc,"reserve_uninstall") as reserve,patch.object(sc,"stop_proxy",side_effect=sc.ConnectError("incomplete stop")):
-                    with patch.object(sc,"unit_action") as action:
-                        with self.assertRaisesRegex(sc.ConnectError,"incomplete stop"):
-                            sc.uninstall(True)
-                        reserve.assert_called_once()
-                        action.assert_not_called()
+        with tempfile.TemporaryDirectory() as d, ExitStack() as patches:
+            root=Path(d)
+            etc=root/"etc";etc.mkdir()
+            (etc/"role").write_text("client\n")
+            patches.enter_context(patch.object(sc,"ETC",etc))
+            patches.enter_context(patch.object(sc,"require_root"))
+            patches.enter_context(patch.object(sc,"locked",return_value=nullcontext()))
+            reservation=patches.enter_context(patch.object(sc,"reserve_uninstall",return_value="RESERVED"))
+            patches.enter_context(patch.object(sc,"stop_proxy",side_effect=sc.ConnectError("incomplete stop")))
+            action=patches.enter_context(patch.object(sc,"unit_action"))
+            with self.assertRaisesRegex(sc.ConnectError,"incomplete stop"):
+                sc.uninstall(True)
+            reservation.assert_called_once()
+            action.assert_not_called()
 
 
     def test_ssh_socket_inventory_captures_all_preexisting_logins(self):
@@ -599,7 +604,7 @@ class SimpleConnectTests(unittest.TestCase):
             teardown=state_dir/"uninstalling.json"
             with patch.object(sc,"TEARDOWN",teardown),patch.object(sc,"STATE",state_dir/"state.json"):
                 sc.write_json(sc.STATE,{"status":"DIRECT"})
-                sc.write_json(teardown,{"status":"REMOVING","boot":"boot","pid":1234,"birth":"old"})
+                sc.write_json(teardown,{"status":"REMOVING","phase":"RESERVED","boot":"boot","pid":1234,"birth":"old"})
                 with patch.object(sc,"boot_id",return_value="boot"):
                     with patch.object(sc,"process_birth",side_effect=lambda pid: "old" if pid==1234 else "now"):
                         with self.assertRaisesRegex(sc.ConnectError,"Another uninstall"):
@@ -678,6 +683,253 @@ class SimpleConnectTests(unittest.TestCase):
                     with patch.object(sc,action):
                         self.assertEqual(sc.main(),0)
                     gate.assert_called_once_with(wait_seconds=6)
+
+    def test_late_uninstall_is_resumable_after_each_crash_window(self):
+        # The same verified-manager function is used on the resumed call.
+        # Every scenario simulates one process dying AFTER a side effect,
+        # then a distinct process acquiring the durable reservation.
+        checkpoints = (
+            "before_timer_disable", "after_timer_disable",
+            "after_first_unit_deletion", "after_all_unit_deletions",
+            "after_daemon_reload", "after_manager_removal",
+            "after_state_removal", "after_role_removal",
+            "after_reservation_removal",
+        )
+        for checkpoint in checkpoints:
+            with self.subTest(checkpoint=checkpoint):
+                with tempfile.TemporaryDirectory() as d, ExitStack() as patches:
+                    root = Path(d)
+                    etc = root / "etc"
+                    data = root / "data"
+                    unitdir = root / "units"
+                    etc.mkdir()
+                    data.mkdir()
+                    unitdir.mkdir()
+                    files = {
+                        "ETC": etc, "STATE_DIR": data,
+                        "STATE": data / "state.json",
+                        "TEARDOWN": data / "uninstalling.json",
+                        "UNIT_DIR": unitdir,
+                        "CONF": etc / "config.json",
+                        "SSH_CONF": etc / "ssh_config",
+                        "KNOWN_HOSTS": etc / "known_hosts",
+                        "APP": root / "manager.py",
+                        "COMMAND": root / "simple-connect",
+                        "PKG": root / "sshuttle",
+                    }
+                    for field, value in files.items():
+                        patches.enter_context(patch.object(sc, field, value))
+                    sc.write_json(sc.STATE, {"status": "DIRECT"})
+                    (etc / "role").write_text("client\n")
+                    sc.APP.write_text("verified manager")
+                    sc.COMMAND.write_text("manager entrypoint")
+                    sc.CONF.write_text("config")
+                    sc.SSH_CONF.write_text("ssh config")
+                    sc.KNOWN_HOSTS.write_text("known hosts")
+                    sc.PKG.mkdir()
+                    (sc.PKG / ".wheel-sha256").write_text(sc.WHEEL_SHA256 + "\n")
+                    units = sc.unit_texts()
+                    for name, body in units.items():
+                        (unitdir / name).write_text(body)
+                    foreign = unitdir / "outside.service"
+                    foreign.write_text("NOT SIMPLE CONNECT")
+                    ssh = root / "system-ssh"
+                    ssh.write_text("SSH MUST SURVIVE")
+                    patches.enter_context(patch.object(sc, "require_root"))
+                    patches.enter_context(patch.object(sc, "locked", return_value=nullcontext()))
+                    patches.enter_context(patch.object(sc, "boot_id", return_value="boot"))
+                    patches.enter_context(patch.object(sc, "service_terminated", return_value=True))
+                    patches.enter_context(patch.object(sc, "any_proxy_tables", return_value=False))
+                    patches.enter_context(patch.object(sc, "stop_proxy"))
+                    # Old and resumed calls have different process birth IDs.
+                    attempt = [0]
+                    patches.enter_context(patch.object(sc, "process_birth",
+                        side_effect=lambda pid: "birth-" + str(attempt[0])))
+                    timer_active = [True]
+                    patches.enter_context(patch.object(sc, "is_active",
+                        side_effect=lambda name: timer_active[0] if name == sc.GUARD_TIMER else False))
+                    def fake_run(argv, **kwargs):
+                        if argv[:2] == ["systemctl", "is-enabled"]:
+                            enabled = timer_active[0]
+                            return subprocess.CompletedProcess(argv, 0 if enabled else 1,
+                                "enabled\n" if enabled else
+                                ("disabled\n" if (unitdir / sc.GUARD_TIMER).exists()
+                                 else "not-found\n"), "")
+                        raise AssertionError("Unexpected system command " + repr(argv))
+                    patches.enter_context(patch.object(sc, "run", side_effect=fake_run))
+
+                    armed = [True]
+                    real_unlink = Path.unlink
+                    unit_to_crash = next(iter(units))
+                    def interrupted_unlink(path, *args, **kwargs):
+                        result = real_unlink(path, *args, **kwargs)
+                        trigger = (
+                            (checkpoint == "after_first_unit_deletion" and path == unitdir / unit_to_crash)
+                            or (checkpoint == "after_manager_removal" and path == sc.APP)
+                            or (checkpoint == "after_state_removal" and path == sc.STATE)
+                            or (checkpoint == "after_role_removal" and path == etc / "role")
+                            or (checkpoint == "after_reservation_removal" and path == sc.TEARDOWN)
+                        )
+                        if armed[0] and trigger:
+                            armed[0] = False
+                            raise RuntimeError("simulated process death: " + checkpoint)
+                        return result
+                    patches.enter_context(patch.object(Path, "unlink", interrupted_unlink))
+                    def fake_unit_action(action, *units_):
+                        if action == "disable":
+                            if checkpoint == "before_timer_disable" and armed[0]:
+                                armed[0] = False
+                                raise RuntimeError("simulated process death: " + checkpoint)
+                            timer_active[0] = False
+                            if checkpoint == "after_timer_disable" and armed[0]:
+                                armed[0] = False
+                                raise RuntimeError("simulated process death: " + checkpoint)
+                        elif action == "daemon-reload":
+                            if checkpoint in ("after_all_unit_deletions", "after_daemon_reload") and armed[0]:
+                                armed[0] = False
+                                raise RuntimeError("simulated process death: " + checkpoint)
+                    patches.enter_context(patch.object(sc, "unit_action", side_effect=fake_unit_action))
+                    with self.assertRaisesRegex(RuntimeError, "simulated process death"):
+                        sc.uninstall(True)
+                    self.assertFalse(armed[0], "Checkpoint was not reached.")
+                    self.assertEqual(foreign.read_text(), "NOT SIMPLE CONNECT")
+                    self.assertEqual(ssh.read_text(), "SSH MUST SURVIVE")
+                    attempt[0] += 1
+                    # The current process is now dead; retry with a distinct
+                    # process birth ID, including after role/state/APP deletion.
+                    sc.uninstall(True)
+                    for name in units:
+                        self.assertFalse((unitdir / name).exists())
+                    self.assertFalse(etc.exists())
+                    self.assertFalse(data.exists())
+                    self.assertFalse(sc.APP.exists())
+                    self.assertFalse(sc.COMMAND.exists())
+                    self.assertFalse(sc.PKG.exists())
+                    self.assertTrue(foreign.exists())
+                    self.assertEqual(ssh.read_text(), "SSH MUST SURVIVE")
+                    sc.uninstall(True)  # idempotent after full completion
+
+    def test_late_uninstall_rejects_unverified_proxy_and_foreign_unit(self):
+        with tempfile.TemporaryDirectory() as d, ExitStack() as patches:
+            root = Path(d)
+            etc = root / "etc"
+            data = root / "data"
+            units = root / "units"
+            etc.mkdir()
+            data.mkdir()
+            units.mkdir()
+            for field, value in (
+                ("ETC", etc), ("STATE_DIR", data),
+                ("STATE", data / "state.json"), ("TEARDOWN", data / "uninstalling.json"),
+                ("UNIT_DIR", units), ("CONF", etc / "config.json"),
+                ("SSH_CONF", etc / "ssh_config"), ("KNOWN_HOSTS", etc / "known_hosts"),
+                ("APP", root / "manager"), ("COMMAND", root / "command"),
+                ("PKG", root / "sshuttle"),
+            ):
+                patches.enter_context(patch.object(sc, field, value))
+            sc.write_json(sc.TEARDOWN, {
+                "status": "REMOVING", "phase": "UNITS_REMOVED",
+                "boot": "old-boot", "pid": 4000, "birth": "old",
+            })
+            foreign = units / sc.SERVICE
+            foreign.write_text("FOREIGN SERVICE: DO NOT DELETE")
+            patches.enter_context(patch.object(sc, "require_root"))
+            patches.enter_context(patch.object(sc, "locked", return_value=nullcontext()))
+            patches.enter_context(patch.object(sc, "boot_id", return_value="new-boot"))
+            attempt=[0]
+            patches.enter_context(patch.object(sc, "process_birth",
+                                               side_effect=lambda pid: "new-birth-" + str(attempt[0])))
+            with patch.object(sc, "service_terminated", return_value=False):
+                with patch.object(sc, "any_proxy_tables") as nft:
+                    with self.assertRaisesRegex(sc.ConnectError, "Proxy or unknown"):
+                        sc.uninstall(True)
+                    nft.assert_not_called()
+            attempt[0]+=1
+            self.assertEqual(foreign.read_text(), "FOREIGN SERVICE: DO NOT DELETE")
+            with patch.object(sc, "service_terminated", return_value=True):
+                with patch.object(sc, "any_proxy_tables", return_value=True):
+                    with self.assertRaisesRegex(sc.ConnectError, "Proxy or unknown"):
+                        sc.uninstall(True)
+            attempt[0]+=1
+            with patch.object(sc, "service_terminated", return_value=True):
+                with patch.object(sc, "any_proxy_tables", return_value=False):
+                    with patch.object(sc, "run", return_value=subprocess.CompletedProcess([], 1, "not-found\n", "")):
+                        with patch.object(sc, "is_active", return_value=False):
+                            with self.assertRaisesRegex(sc.ConnectError, "Unexpected modified"):
+                                sc.uninstall(True)
+            self.assertEqual(foreign.read_text(), "FOREIGN SERVICE: DO NOT DELETE")
+            self.assertTrue(sc.TEARDOWN.exists())
+
+    def test_missing_role_without_checkpoint_must_not_adopt_cleanup(self):
+        with tempfile.TemporaryDirectory() as d, ExitStack() as patches:
+            root=Path(d)
+            data=root/"data";data.mkdir()
+            etc=root/"etc";etc.mkdir()
+            for field,value in (("ETC",etc),("STATE_DIR",data),
+                                ("STATE",data/"state.json"),("TEARDOWN",data/"uninstalling.json")):
+                patches.enter_context(patch.object(sc,field,value))
+            sc.write_json(sc.TEARDOWN,{"status":"REMOVING","phase":"RESERVED",
+                                     "boot":"old","pid":4000,"birth":"old"})
+            patches.enter_context(patch.object(sc,"require_root"))
+            patches.enter_context(patch.object(sc,"locked",return_value=nullcontext()))
+            with self.assertRaisesRegex(sc.ConnectError,"CLIENT role missing before"):
+                sc.uninstall(True)
+            self.assertTrue(sc.TEARDOWN.exists())
+
+    def test_legacy_unphased_late_teardown_can_resume_only_if_proven_safe(self):
+        with tempfile.TemporaryDirectory() as d, ExitStack() as patches:
+            root=Path(d)
+            etc=root/"etc";etc.mkdir()
+            data=root/"data";data.mkdir()
+            unitdir=root/"units";unitdir.mkdir()
+            fields=(("ETC",etc),("STATE_DIR",data),("STATE",data/"state.json"),
+                    ("TEARDOWN",data/"uninstalling.json"),("UNIT_DIR",unitdir),
+                    ("CONF",etc/"config.json"),("SSH_CONF",etc/"ssh_config"),
+                    ("KNOWN_HOSTS",etc/"known_hosts"),("APP",root/"app"),
+                    ("COMMAND",root/"command"),("PKG",root/"sshuttle"))
+            for name,path in fields:
+                patches.enter_context(patch.object(sc,name,path))
+            sc.write_json(sc.TEARDOWN,{"status":"REMOVING","boot":"previous",
+                                      "pid":4567,"birth":"previous"})
+            patches.enter_context(patch.object(sc,"require_root"))
+            patches.enter_context(patch.object(sc,"locked",return_value=nullcontext()))
+            patches.enter_context(patch.object(sc,"boot_id",return_value="current"))
+            patches.enter_context(patch.object(sc,"process_birth",return_value="new"))
+            patches.enter_context(patch.object(sc,"is_active",return_value=False))
+            patches.enter_context(patch.object(sc,"service_terminated",return_value=True))
+            patches.enter_context(patch.object(sc,"any_proxy_tables",return_value=False))
+            patches.enter_context(patch.object(sc,"run",
+                return_value=subprocess.CompletedProcess([],1,"not-found\n","")))
+            patches.enter_context(patch.object(sc,"unit_action"))
+            sc.uninstall(True)
+            self.assertFalse(data.exists())
+            self.assertFalse(etc.exists())
+
+    def test_legacy_marker_with_missing_state_does_not_hide_unsafe_units(self):
+        with tempfile.TemporaryDirectory() as d, ExitStack() as patches:
+            root=Path(d);etc=root/"etc";etc.mkdir()
+            data=root/"data";data.mkdir()
+            units=root/"units";units.mkdir()
+            for field,value in (("ETC",etc),("STATE_DIR",data),
+                                ("STATE",data/"state.json"),("TEARDOWN",data/"uninstalling.json"),
+                                ("UNIT_DIR",units)):
+                patches.enter_context(patch.object(sc,field,value))
+            sc.write_json(sc.TEARDOWN,{"status":"REMOVING","boot":"old",
+                                      "pid":3456,"birth":"old"})
+            (units/sc.SERVICE).write_text("FOREIGN")
+            patches.enter_context(patch.object(sc,"require_root"))
+            patches.enter_context(patch.object(sc,"locked",return_value=nullcontext()))
+            patches.enter_context(patch.object(sc,"boot_id",return_value="new"))
+            patches.enter_context(patch.object(sc,"process_birth",return_value="new"))
+            patches.enter_context(patch.object(sc,"service_terminated",return_value=True))
+            patches.enter_context(patch.object(sc,"any_proxy_tables",return_value=False))
+            patches.enter_context(patch.object(sc,"is_active",return_value=False))
+            patches.enter_context(patch.object(sc,"run",
+                return_value=subprocess.CompletedProcess([],1,"not-found\n","")))
+            with self.assertRaisesRegex(sc.ConnectError,"Unexpected modified"):
+                sc.uninstall(True)
+            self.assertEqual((units/sc.SERVICE).read_text(),"FOREIGN")
+            self.assertTrue(sc.TEARDOWN.exists())
 
     def test_bootstrap_hash_matches_manager(self):
         repo = Path(__file__).resolve().parents[1]

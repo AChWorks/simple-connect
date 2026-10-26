@@ -245,27 +245,72 @@ def process_birth(pid: int) -> str | None:
         return None
 
 
-def reserve_uninstall() -> None:
-    """Durable lifecycle reservation; called with manager lock held."""
+UNINSTALL_PHASES = ("RESERVED", "STOPPED", "TIMER_DISABLED", "UNITS_REMOVED", "PAYLOAD_REMOVED")
+
+
+def uninstall_phase(marker: dict) -> str:
+    if marker.get("status") != "REMOVING":
+        fail("Invalid uninstall reservation; preserve resources for inspection.")
+    phase = marker.get("phase", "RESERVED")  # older incomplete reservations
+    if phase not in UNINSTALL_PHASES:
+        fail("Unknown uninstall phase; refusing unsafe recovery.")
+    return phase
+
+
+def reserve_uninstall() -> str:
+    """Reserve or resume teardown with a durable monotonic phase.
+
+    Called under the manager lock. Incomplete teardown is never adopted as
+    a fresh client installation, nor is progress reset during resume.
+    """
+    phase = "RESERVED"
+    started = int(time.time())
     if teardown_pending():
         old = read_json(TEARDOWN)
+        phase = uninstall_phase(old)
+        started = old.get("started", started)
         previous_pid = old.get("pid")
         if (old.get("boot") == boot_id() and type(previous_pid) is int
                 and process_birth(previous_pid) is not None
                 and process_birth(previous_pid) == old.get("birth")):
             fail("Another uninstall operation remains active; refusing overlap.")
-        say("Resuming interrupted client uninstall.", "WARN")
-    state = read_json(STATE, {"status": "DIRECT"})
-    if state.get("status") == "STOPPING" and not teardown_pending():
-        fail("OFF/recovery is already in progress. Retry uninstall after it completes.")
+        if "phase" not in old and (
+                not (ETC / "role").exists() or not STATE.exists()):
+            # A partially removed R3-era installation lacked phase
+            # checkpoints. Adopt ONLY a demonstrably post-unit-removal
+            # state; never infer safety merely from missing role/state.
+            verify_uninstall_network("UNITS_REMOVED")
+            verify_uninstall_timer()
+            verify_uninstall_units()
+            if is_active(GUARD_UNIT) or is_active(STOP_UNIT):
+                fail("Legacy teardown has active helper units; manual inspection required.")
+            if any((UNIT_DIR / name).exists() or (UNIT_DIR / name).is_symlink()
+                   for name in unit_texts()):
+                fail("Legacy teardown missing role/state but still has unit files.")
+            verify_uninstall_role("UNITS_REMOVED")
+            phase = "UNITS_REMOVED"
+        say(f"Resuming interrupted client uninstall at {phase}.", "WARN")
+    else:
+        state = read_json(STATE, {"status": "DIRECT"})
+        if state.get("status") == "STOPPING":
+            fail("OFF/recovery is already in progress. Retry uninstall after it completes.")
     birth = process_birth(os.getpid())
     if birth is None:
         fail("Cannot prove current uninstall process identity.")
     write_json(TEARDOWN, {
-        "status": "REMOVING", "boot": boot_id(),
-        "pid": os.getpid(), "birth": birth,
-        "started": int(time.time()),
+        "status": "REMOVING", "phase": phase, "boot": boot_id(),
+        "pid": os.getpid(), "birth": birth, "started": started,
     })
+    return phase
+
+
+def advance_uninstall_phase(phase: str) -> None:
+    """Checkpoint completed teardown stage before entering the next stage."""
+    marker = read_json(TEARDOWN)
+    previous = uninstall_phase(marker)
+    if UNINSTALL_PHASES.index(phase) != UNINSTALL_PHASES.index(previous) + 1:
+        fail("Unexpected uninstall phase transition; preserving resources.")
+    write_json(TEARDOWN, {**marker, "phase": phase})
 
 
 
@@ -1252,13 +1297,103 @@ def logs() -> None:
          "-u", GUARD_UNIT], timeout=12, capture=False)
 
 
+def verify_uninstall_role(phase: str) -> None:
+    """Role may disappear only after the units-removal checkpoint."""
+    role = ETC / "role"
+    if role.is_symlink() or (role.exists() and not role.is_file()):
+        fail("Unexpected role file during uninstall; preserving resources.")
+    if role.exists():
+        if role.read_text().strip() != "client":
+            fail("Uninstall reservation conflicts with the current host role.")
+    elif UNINSTALL_PHASES.index(phase) < UNINSTALL_PHASES.index("UNITS_REMOVED"):
+        fail("CLIENT role missing before verified unit removal; refuse recovery.")
+
+
+def verify_uninstall_network(phase: str) -> None:
+    """Never infer safe teardown from missing state or from a marker alone."""
+    if not service_terminated() or any_proxy_tables():
+        fail("Proxy or unknown firewall table remains: uninstall cannot advance.")
+    if STATE.is_symlink() or (STATE.exists() and not STATE.is_file()):
+        fail("Unsafe client state path during uninstall.")
+    if STATE.exists():
+        if read_json(STATE).get("status") != "DIRECT":
+            fail("Recovery not DIRECT; preserve teardown marker and recovery files.")
+    elif UNINSTALL_PHASES.index(phase) < UNINSTALL_PHASES.index("UNITS_REMOVED"):
+        fail("Client state missing before verified unit removal; refuse teardown.")
+
+
+def verify_uninstall_units() -> None:
+    """Allow missing already-removed units, but never adopt foreign unit files."""
+    for name, expected in unit_texts().items():
+        path = UNIT_DIR / name
+        if path.is_symlink() or (path.exists() and
+             (not path.is_file() or path.read_text() != expected)):
+            fail(f"Unexpected modified systemd unit {path}; refuse removal.")
+
+
+def verify_uninstall_timer() -> None:
+    if is_active(GUARD_TIMER):
+        fail("Independent guard timer is still active; keep manager installed.")
+    enabled = run(["systemctl", "is-enabled", GUARD_TIMER], check=False, timeout=10)
+    if enabled.returncode == 0 or enabled.stdout.strip() not in (
+            "disabled", "not-found", "masked"):
+        fail("Cannot prove guard timer disabled; keep recovery executable.")
+
+
+def verify_uninstall_payload_paths() -> None:
+    for path in (CONF, SSH_CONF, KNOWN_HOSTS, STATE, ETC / "role", APP, COMMAND):
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            fail(f"Unexpected non-file/symlink at {path}; no destructive cleanup.")
+    if PKG.is_symlink() or (PKG.exists() and not PKG.is_dir()):
+        fail("Unexpected package path; preserving it.")
+    if PKG.exists():
+        marker = PKG / ".wheel-sha256"
+        if marker.is_symlink() or not marker.is_file() or marker.read_text().strip() != WHEEL_SHA256:
+            fail("Unrecognized sshuttle package; refusing to delete foreign content.")
+
+
+def finish_uninstalled_directories() -> None:
+    """Resume the final narrow gap after the durable reservation was removed.
+
+    Only empty, private Simple Connect directories may be removed here.
+    This never adopts missing state as evidence that a proxy was safely
+    stopped: systemd and nftables are checked again independently.
+    """
+    if teardown_pending():
+        fail("Uninstall reservation still present; complete teardown first.")
+    if not service_terminated() or any_proxy_tables():
+        fail("Cannot finish uninstall: live proxy or firewall interception.")
+    if is_active(GUARD_UNIT) or is_active(STOP_UNIT):
+        fail("Cannot finish uninstall with an active Simple Connect helper.")
+    verify_uninstall_timer()
+    verify_uninstall_units()
+    if any((UNIT_DIR / name).exists() or (UNIT_DIR / name).is_symlink()
+           for name in unit_texts()):
+        fail("Cannot finish uninstall while Simple Connect unit files remain.")
+    verify_uninstall_payload_paths()
+    if any(path.exists() or path.is_symlink()
+           for path in (CONF, SSH_CONF, KNOWN_HOSTS, STATE, ETC / "role", APP, COMMAND, PKG)):
+        fail("Cannot finish uninstall: installed payload still exists.")
+    for directory in (ETC, STATE_DIR):
+        if directory.is_symlink():
+            fail(f"Unexpected symlinked directory {directory}.")
+        if directory.exists():
+            if not directory.is_dir() or any(directory.iterdir()):
+                fail(f"Unexpected content in {directory}: no deletion performed.")
+            directory.rmdir()
+
+
 def uninstall(yes: bool) -> None:
     require_root()
     if not yes:
         fail("Uninstall destroys Simple Connect's private configuration. Use 'uninstall --yes'.")
+    if ETC.is_symlink() or STATE_DIR.is_symlink():
+        fail("Symlinked Simple Connect private directory: refuse uninstall.")
     role_path = ETC / "role"
+    if role_path.is_symlink():
+        fail("Symlinked role file: refusing uninstall.")
     if role_path.is_file() and role_path.read_text().strip() == "server":
-        # Server-only cleanup does not touch SSH accounts or host firewall.
+        # Remote endpoint never installed any traffic interception.
         with locked():
             require_no_teardown()
             if STATE.exists() or not service_terminated():
@@ -1271,68 +1406,137 @@ def uninstall(yes: bool) -> None:
         say("Server-side Simple Connect manager removed; existing SSH remains unchanged.", "OK")
         return
 
-    require_client_role()
     with locked():
-        reserve_uninstall()
+        if teardown_pending():
+            # The verified reservation survives role/state/manager deletion.
+            # reserve_uninstall also validates any legacy unphased marker.
+            phase = reserve_uninstall()
+            verify_uninstall_role(phase)
+        elif role_path.is_file():
+            require_client_role()
+            phase = reserve_uninstall()
+        elif not role_path.exists():
+            finish_uninstalled_directories()
+            say("Already uninstalled; any empty private directories cleaned.", "OK")
+            return
+        else:
+            fail("Unexpected role path; refusing ambiguous uninstall.")
 
-    # The reservation, not the manager lock, excludes concurrent ON/SETUP,
-    # CONFIGURE, CONFIRM and ordinary OFF during systemd stop / teardown.
-    # ExecStopPost still needs to obtain the normal manager lock.
-    stop_proxy(for_uninstall=True)
-    with locked():
-        if (read_json(STATE, {"status": "UNKNOWN"}).get("status") != "DIRECT"
-                or not service_terminated() or any_proxy_tables()):
-            fail("Recovery incomplete; preserving manager and teardown reservation.")
+    # No manager lock across systemctl stop: ExecStopPost must take it.
+    # Every stage is repeatable from its durable checkpoint. A crash
+    # *within* a stage leaves the previous phase and is safe to retry.
+    if phase == "RESERVED":
+        stop_proxy(for_uninstall=True)
+        with locked():
+            verify_uninstall_role(phase)
+            verify_uninstall_network(phase)
+            advance_uninstall_phase("STOPPED")
+        phase = "STOPPED"
 
-    # Never ignore failed disablement or delete unit code while systemd
-    # can still invoke it.
-    unit_action("disable", "--now", GUARD_TIMER)
-    if is_active(GUARD_TIMER):
-        fail("Independent guard timer remains active; refusing to remove manager.")
-    enabled = run(["systemctl", "is-enabled", GUARD_TIMER], check=False, timeout=10)
-    if enabled.returncode == 0 or enabled.stdout.strip() not in ("disabled", "not-found", "masked"):
-        fail("Could not verify guard timer is disabled; resources retained.")
-    if is_active(GUARD_UNIT):
-        unit_action("stop", GUARD_UNIT)
-    if is_active(GUARD_UNIT):
-        fail("Guard service remains active; resources retained.")
+    if phase == "STOPPED":
+        with locked():
+            verify_uninstall_role(phase)
+            verify_uninstall_network(phase)
+            verify_uninstall_units()
+        # If a previous interrupted removal left the timer file absent,
+        # use systemd's independent inactive/disabled proof to skip
+        # the now-impossible unit file disable operation.
+        if (UNIT_DIR / GUARD_TIMER).exists():
+            unit_action("disable", "--now", GUARD_TIMER)
+        elif is_active(GUARD_TIMER):
+            unit_action("stop", GUARD_TIMER)
+        verify_uninstall_timer()
+        if is_active(GUARD_UNIT):
+            unit_action("stop", GUARD_UNIT)
+        if is_active(GUARD_UNIT):
+            fail("Guard service still active; preserving recovery files.")
+        with locked():
+            verify_uninstall_network(phase)
+            advance_uninstall_phase("TIMER_DISABLED")
+        phase = "TIMER_DISABLED"
 
-    # Check the whole set before deleting any systemd file.
-    for name, expected in unit_texts().items():
-        path = UNIT_DIR / name
-        if path.is_symlink() or (path.exists() and
-             (not path.is_file() or path.read_text() != expected)):
-            fail(f"Unexpected modified systemd unit: {path}; retain for inspection.")
+    if phase == "TIMER_DISABLED":
+        verify_uninstall_network(phase)
+        verify_uninstall_timer()
+        verify_uninstall_units()
+        if is_active(GUARD_UNIT):
+            unit_action("stop", GUARD_UNIT)
+        if is_active(GUARD_UNIT):
+            fail("Guard service did not stop; retain recovery executables.")
+        with locked():
+            verify_uninstall_network(phase)
+            for name in unit_texts():
+                path = UNIT_DIR / name
+                if path.exists():
+                    path.unlink()
+        unit_action("daemon-reload")
+        verify_uninstall_timer()
+        if is_active(GUARD_UNIT) or is_active(STOP_UNIT):
+            fail("Simple Connect helper is active after unit removal.")
+        with locked():
+            verify_uninstall_network(phase)
+            advance_uninstall_phase("UNITS_REMOVED")
+        phase = "UNITS_REMOVED"
 
-    with locked():
-        if (not teardown_pending() or not service_terminated() or any_proxy_tables()
-                or read_json(STATE).get("status") != "DIRECT"):
-            fail("Uninstall safety prerequisites changed; keeping owned resources.")
-        for name in unit_texts():
-            path = UNIT_DIR / name
-            if path.is_file():
-                path.unlink()
-    unit_action("daemon-reload")
+    if phase == "UNITS_REMOVED":
+        with locked():
+            verify_uninstall_role(phase)
+            verify_uninstall_network(phase)
+            verify_uninstall_timer()
+            verify_uninstall_units()
+            if any((UNIT_DIR / name).exists() or (UNIT_DIR / name).is_symlink()
+                   for name in unit_texts()):
+                fail("Unit files unexpectedly reappeared; preserving recovery assets.")
+            if is_active(GUARD_UNIT) or is_active(STOP_UNIT):
+                fail("A Simple Connect helper is still active.")
+            # Validate every owned payload path BEFORE deleting any file.
+            # A partial payload deletion is safe to resume: absent files
+            # are accepted but foreign/symlinked paths are not.
+            verify_uninstall_payload_paths()
+            for path in (CONF, SSH_CONF, KNOWN_HOSTS):
+                if path.is_file():
+                    path.unlink()
+            if PKG.exists():
+                shutil.rmtree(PKG)
+            # Keep the installed entrypoint until the last payload stage,
+            # maximizing the chance that normal CLI retry stays available.
+            for path in (STATE, role_path, COMMAND, APP):
+                if path.is_file():
+                    path.unlink()
+            advance_uninstall_phase("PAYLOAD_REMOVED")
+        phase = "PAYLOAD_REMOVED"
 
-    # Preserve role, manager and reservation until all systemd operations
-    # have succeeded. An interrupted teardown can be resumed with --yes.
-    for path in (CONF, SSH_CONF, KNOWN_HOSTS):
-        if path.is_file() and not path.is_symlink():
-            path.unlink()
-    if PKG.exists() and PKG.joinpath(".wheel-sha256").is_file():
-        shutil.rmtree(PKG)
-    for path in (COMMAND, APP):
-        if path.is_file() and not path.is_symlink():
-            path.unlink()
-    for path in (STATE, role_path):
-        if path.is_file() and not path.is_symlink():
-            path.unlink()
-    TEARDOWN.unlink()
-    for path in (ETC, STATE_DIR):
-        if path.is_dir() and not any(path.iterdir()):
-            path.rmdir()
-    say("Owned resources removed; no global firewall, route, SSH or credentials were changed.", "OK")
+    if phase == "PAYLOAD_REMOVED":
+        with locked():
+            verify_uninstall_role(phase)
+            verify_uninstall_network(phase)
+            verify_uninstall_timer()
+            verify_uninstall_units()
+            if is_active(GUARD_UNIT) or is_active(STOP_UNIT):
+                fail("Simple Connect helper is active; refusing to finalize uninstall.")
+            verify_uninstall_payload_paths()
+            if any(path.exists() or path.is_symlink()
+                   for path in (CONF, SSH_CONF, KNOWN_HOSTS, STATE,
+                                role_path, APP, COMMAND, PKG)):
+                fail("Payload remains after teardown; reservation retained.")
+            if any((UNIT_DIR / name).exists() or (UNIT_DIR / name).is_symlink()
+                   for name in unit_texts()):
+                fail("Unit files remain after teardown; reservation retained.")
+            if ETC.is_symlink() or STATE_DIR.is_symlink():
+                fail("Unexpected symlink in private directories; refusing cleanup.")
+            if ETC.exists():
+                if not ETC.is_dir() or any(ETC.iterdir()):
+                    fail("Unexpected remaining configuration; retaining reservation.")
+                ETC.rmdir()
+            if not STATE_DIR.is_dir() or any(p != TEARDOWN for p in STATE_DIR.iterdir()):
+                fail("Unexpected state-directory content; retaining reservation.")
+            # Reservation is the final owned file to remove. If interrupted
+            # between this unlink and rmdir, verified-manager uninstall
+            # will finish the now-empty private directories safely.
+            TEARDOWN.unlink()
+            STATE_DIR.rmdir()
 
+    say("Owned resources removed; SSH, foreign firewall rules and routes unchanged.", "OK")
 
 
 def menu() -> None:
