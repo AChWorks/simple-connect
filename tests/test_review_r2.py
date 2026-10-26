@@ -26,6 +26,13 @@ class RemediationTests(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         return key
 
+    def host_record(self, key, ip, port):
+        fields=Path(str(key)+".pub").read_text().split()
+        label=ip if port==22 else f"[{ip}]:{port}"
+        record=f"{label} {fields[0]} {fields[1]}\n"
+        fp=sc.pinned_host_identity({"remote_ip":ip,"ssh_port":port},record.encode())
+        return record,fp
+
     def fixture(self, stack, root, cfg=None):
         etc = root / "etc"
         etc.mkdir()
@@ -76,7 +83,9 @@ class RemediationTests(unittest.TestCase):
             original=pub.read_bytes()
             cfg={"remote_ip":"8.8.8.8","ssh_user":"root","ssh_port":56777,"identity_file":str(key)}
             objs=self.fixture(st,root,cfg)
-            objs["KNOWN_HOSTS"].write_text("[8.8.8.8]:56777 ssh-ed25519 AAAAPIN\n")
+            rec,_=self.host_record(self.make_key(root,"host"),"8.8.8.8",56777)
+            objs["KNOWN_HOSTS"].write_text(rec)
+            st.enter_context(patch.object(sc,"yes_no",return_value=True))
             st.enter_context(patch.object(sc,"run",return_value=subprocess.CompletedProcess([],0,original.decode(),"")))
             remote=st.enter_context(patch.object(sc.subprocess,"run"))
             for content in (original+original,original+b"# comment record\n",original+b"\n"):
@@ -125,37 +134,59 @@ class RemediationTests(unittest.TestCase):
             key=self.make_key(root)
             cfg={"remote_ip":"8.8.8.8","ssh_user":"root","ssh_port":56777,"identity_file":str(key)}
             objs=self.fixture(st,root,cfg)
-            objs["KNOWN_HOSTS"].write_text("[8.8.8.8]:56777 ssh-ed25519 AAAAPIN\n")
+            host_line,host_fp=self.host_record(self.make_key(root,"host"),"8.8.8.8",56777)
+            objs["KNOWN_HOSTS"].write_text(host_line)
+            pub=Path(str(key)+".pub")
             st.enter_context(patch.object(sc,"run",
-                return_value=subprocess.CompletedProcess([],0,Path(str(key)+".pub").read_text(),"")))
-            remote=st.enter_context(patch.object(sc.subprocess,"run",
-                return_value=subprocess.CompletedProcess([],0,"","")))
+                return_value=subprocess.CompletedProcess([],0,pub.read_text(),"")))
+            st.enter_context(patch.object(sc,"yes_no",return_value=True))
+            checked={}
+            def remote_cmd(args,**kwargs):
+                checked["args"]=list(args)
+                staging_pub=Path(args[args.index("-i")+1])
+                staging_hosts=Path(next(a.split("=",1)[1] for a in args if a.startswith("UserKnownHostsFile=")))
+                self.assertNotEqual(staging_pub,pub)
+                self.assertNotEqual(staging_hosts,objs["KNOWN_HOSTS"])
+                self.assertEqual(sc.read_public_key_record(staging_pub),sc.read_public_key_record(pub))
+                self.assertEqual(staging_hosts.read_text(),host_line)
+                self.assertEqual(sc.pinned_host_identity(cfg,staging_hosts.read_bytes()),host_fp)
+                return subprocess.CompletedProcess(args,0,"","")
+            remote=st.enter_context(patch.object(sc.subprocess,"run",side_effect=remote_cmd))
             sc.enroll_public_key()
             self.assertEqual(remote.call_count,1)
-            args=remote.call_args.args[0]
+            args=checked["args"]
             self.assertEqual(args[0],"/usr/bin/ssh-copy-id")
-            self.assertEqual(args[args.index("-i")+1],str(key)+".pub")
             self.assertEqual(args[-1],"root@8.8.8.8")
             self.assertIn("StrictHostKeyChecking=yes",args)
+            self.assertIn("GlobalKnownHostsFile=/dev/null",args)
+            self.assertIn("UpdateHostKeys=no",args)
             env=remote.call_args.kwargs["env"]
             self.assertEqual(env["HOME"],"/root")
             self.assertEqual(env["PATH"],"/usr/sbin:/usr/bin:/sbin:/bin")
             self.assertNotIn("SSH_AUTH_SOCK",env)
 
+
     def test_simultaneous_configure_only_one_wins(self):
         with tempfile.TemporaryDirectory() as d, contextlib.ExitStack() as st:
             root=Path(d)
             key=self.make_key(root)
+            server=self.make_key(root,"host")
+            _,host_fp=self.host_record(server,"8.8.8.8",56777)
+            host_blob=Path(str(server)+".pub").read_text().split()[1]
             objs=self.fixture(st,root)
             barrier=threading.Barrier(2,timeout=6)
             def fake_run(args,**kwargs):
                 if args[0]=="ssh-keyscan":
                     barrier.wait()
-                return self.fake_host(args,**kwargs)
+                    return subprocess.CompletedProcess(args,0,
+                        f"[{args[-1]}]:56777 ssh-ed25519 {host_blob}\n","")
+                if args[0]=="ssh-keygen":
+                    return subprocess.CompletedProcess(args,0,f"256 {host_fp} host\n","")
+                self.fail(f"Unexpected command: {args}")
             st.enter_context(patch.object(sc,"run",side_effect=fake_run))
             def configure_one(host):
                 try:
-                    sc.configure(host,"root",56777,str(key),FP)
+                    sc.configure(host,"root",56777,str(key),host_fp)
                     return ("OK",host)
                 except sc.ConnectError as e:
                     return ("ERROR",str(e))
@@ -236,7 +267,9 @@ class RemediationTests(unittest.TestCase):
             objects=self.fixture(st,root,{
                 "remote_ip":"8.8.8.8","ssh_user":"root","ssh_port":22,
                 "identity_file":str(key)})
-            objects["KNOWN_HOSTS"].write_text("8.8.8.8 ssh-ed25519 AAAAPIN\n")
+            line,_=self.host_record(self.make_key(root,"host"),"8.8.8.8",22)
+            objects["KNOWN_HOSTS"].write_text(line)
+            st.enter_context(patch.object(sc,"yes_no",return_value=True))
             st.enter_context(patch.object(sc,"run",return_value=subprocess.CompletedProcess([],0,
                 Path(str(other)+".pub").read_text(),"")))
             remote=st.enter_context(patch.object(sc.subprocess,"run"))

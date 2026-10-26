@@ -39,6 +39,13 @@ class CliOnboardingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return key
 
+    def host_record(self, key: Path, ip: str, port: int) -> tuple[str, str]:
+        fields = Path(str(key) + ".pub").read_text().split()
+        label = ip if port == 22 else f"[{ip}]:{port}"
+        line = f"{label} {fields[0]} {fields[1]}\n"
+        fp = sc.pinned_host_identity({"remote_ip": ip, "ssh_port": port}, line.encode())
+        return line, fp
+
     def test_key_directory_permissions_require_operator_consent(self):
         with tempfile.TemporaryDirectory() as d:
             folder = Path(d) / ".ssh"
@@ -137,6 +144,7 @@ class CliOnboardingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             key = self.make_key(root)
+            host_record, host_fp = self.host_record(self.make_key(root, "host_key"), "8.8.8.8", 22022)
             etc = root / "etc"
             etc.mkdir()
             active = {"held": False, "count": 0}
@@ -145,16 +153,15 @@ class CliOnboardingTests(unittest.TestCase):
                 if argv[0] == "ssh-keyscan":
                     self.assertEqual(argv[-1], "8.8.8.8")
                     self.assertIn("22022", argv)
-                    return subprocess.CompletedProcess(argv, 0,
-                        "[8.8.8.8]:22022 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMOCK\n", "")
+                    return subprocess.CompletedProcess(argv, 0, host_record, "")
                 if argv[0] == "ssh-keygen":
                     return subprocess.CompletedProcess(argv, 0,
-                        "256 " + FP + " remote (ED25519)\n", "")
+                        "256 " + host_fp + " remote (ED25519)\n", "")
                 self.fail(f"unexpected command: {argv}")
             def prompt(_):
                 self.assertFalse(active["held"], "input under manager lock")
                 return next(values)
-            values = iter(["8.8.8.8", "root", "22022", str(key), FP, "n", "n"])
+            values = iter(["8.8.8.8", "root", "22022", str(key), host_fp, "n", "n"])
             with patch.object(sc, "ETC", etc), patch.object(sc, "KNOWN_HOSTS", etc / "known_hosts"), (
                  patch.object(sc, "SSH_CONF", etc / "ssh_config")), (
                  patch.object(sc, "CONF", etc / "config.json")), (
@@ -182,12 +189,13 @@ class CliOnboardingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             key = self.make_key(root)
+            host_record, host_fp = self.host_record(self.make_key(root, "host_key"), "8.8.8.8", 22022)
             etc = root / "etc"
             etc.mkdir()
             def mock_run(argv, **kwargs):
                 if argv[0] == "ssh-keyscan":
-                    return subprocess.CompletedProcess(argv, 0, "8.8.8.8 ssh-ed25519 AAAAKEY\n", "")
-                return subprocess.CompletedProcess(argv, 0, "256 " + FP + " host\n", "")
+                    return subprocess.CompletedProcess(argv, 0, host_record, "")
+                return subprocess.CompletedProcess(argv, 0, "256 " + host_fp + " host\n", "")
             with patch.object(sc, "ETC", etc), patch.object(sc, "KNOWN_HOSTS", etc / "known_hosts"), (
                  patch.object(sc, "SSH_CONF", etc / "ssh_config")), (
                  patch.object(sc, "CONF", etc / "config.json")), (
@@ -212,6 +220,10 @@ class CliOnboardingTests(unittest.TestCase):
                  patch.object(sc, "require_client_role")), (
                  patch.object(sc, "require_no_teardown")), (
                  patch.object(sc, "read_config", return_value={"identity_file": "/any/key"})), (
+                 patch.object(sc, "read_json", return_value={"status": "DIRECT"})), (
+                 patch.object(sc, "locked", return_value=contextlib.nullcontext())), (
+                 patch.object(sc, "service_terminated", return_value=True)), (
+                 patch.object(sc, "any_proxy_tables", return_value=False)), (
                  patch.object(sc.subprocess, "run")) as remote:
                 with self.assertRaisesRegex(sc.ConnectError, "Trusted SSH host key missing"):
                     sc.enroll_public_key()
@@ -220,12 +232,28 @@ class CliOnboardingTests(unittest.TestCase):
     def test_enrollment_uses_selected_host_port_username_and_strict_host_key(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            known = root / "known_hosts"
-            known.write_text("[8.8.8.8]:56777 ssh-ed25519 AAAAKEY\n")
             key = self.make_key(root, "key")
+            record, host_fp = self.host_record(self.make_key(root, "host_key"), "8.8.8.8", 56777)
+            known = root / "known_hosts"
+            known.write_text(record)
             pub = Path(str(key) + ".pub")
             cfg = {"identity_file": str(key), "ssh_user": "root",
                    "ssh_port": 56777, "remote_ip": "8.8.8.8"}
+            observed = {}
+            def remote_action(args, **kwargs):
+                observed["args"] = list(args)
+                stage_pub = Path(args[args.index("-i") + 1])
+                host_arg = next(a for a in args if a.startswith("UserKnownHostsFile="))
+                stage_hosts = Path(host_arg.partition("=")[2])
+                self.assertNotEqual(stage_pub, pub)
+                self.assertNotEqual(stage_hosts, known)
+                self.assertEqual(sc.read_public_key_record(stage_pub), sc.read_public_key_record(pub))
+                self.assertEqual(stage_hosts.read_text(), record)
+                self.assertTrue(Path(str(stage_pub)[:-4]).is_file())
+                return subprocess.CompletedProcess(args, 0, "", "")
+            def mock_run(args, **kwargs):
+                self.assertEqual(args[0], "ssh-keygen")
+                return subprocess.CompletedProcess(args, 0, pub.read_text(), "")
             with patch.object(sc, "KNOWN_HOSTS", known), (
                  patch.object(sc, "require_root")), (
                  patch.object(sc, "require_client_role")), (
@@ -235,19 +263,22 @@ class CliOnboardingTests(unittest.TestCase):
                  patch.object(sc, "locked", return_value=contextlib.nullcontext())), (
                  patch.object(sc, "service_terminated", return_value=True)), (
                  patch.object(sc, "any_proxy_tables", return_value=False)), (
-                 patch.object(sc, "validated_public_key", return_value=pub)), (
-                 patch.object(sc.subprocess, "run",
-                              return_value=subprocess.CompletedProcess([], 0, "", ""))) as remote:
+                 patch.object(sc, "run", side_effect=mock_run)), (
+                 patch.object(sc.sys, "stdin", TTY())), (
+                 patch("builtins.input", return_value="y")), (
+                 patch.object(sc.subprocess, "run", side_effect=remote_action)) as remote:
                 sc.enroll_public_key()
-            args = remote.call_args.args[0]
+            args = observed["args"]
+            self.assertEqual(remote.call_count, 1)
             self.assertEqual(args[0], "/usr/bin/ssh-copy-id")
             self.assertEqual(args[-1], "root@8.8.8.8")
             self.assertEqual(args[args.index("-p") + 1], "56777")
-            self.assertEqual(args[args.index("-i") + 1], str(pub))
             self.assertIn("StrictHostKeyChecking=yes", args)
-            self.assertIn("UserKnownHostsFile=" + str(known), args)
+            self.assertIn("GlobalKnownHostsFile=/dev/null", args)
+            self.assertIn("UpdateHostKeys=no", args)
             self.assertEqual(remote.call_args.kwargs["timeout"], 180)
             self.assertNotIn("sshpass", args)
+
 
     def test_enrollment_refuses_active_state_without_remote_mutation(self):
         with tempfile.TemporaryDirectory() as d:
@@ -446,14 +477,15 @@ class CliOnboardingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             key = self.make_key(root)
+            host_record, host_fp = self.host_record(self.make_key(root, "host_key"), "8.8.8.8", 22)
             etc = root / "etc"
             etc.mkdir()
             prior = etc / "config.json"
             prior.write_bytes(b"existing content unchanged\n")
             def fake_run(argv, **kwargs):
                 if argv[0] == "ssh-keyscan":
-                    return subprocess.CompletedProcess(argv, 0, "8.8.8.8 ssh-ed25519 AAAAPIN\n", "")
-                return subprocess.CompletedProcess(argv, 0, "256 " + FP + " host\n", "")
+                    return subprocess.CompletedProcess(argv, 0, host_record, "")
+                return subprocess.CompletedProcess(argv, 0, "256 " + host_fp + " host\n", "")
             with patch.object(sc, "ETC", etc), (
                  patch.object(sc, "KNOWN_HOSTS", etc / "known_hosts")), (
                  patch.object(sc, "SSH_CONF", etc / "ssh_config")), (
@@ -469,7 +501,7 @@ class CliOnboardingTests(unittest.TestCase):
                               side_effect=[{"status": "DIRECT"}, {"status": "PENDING"}])), (
                  patch.object(sc, "run", side_effect=fake_run)):
                 with self.assertRaisesRegex(sc.ConnectError, "Network state changed"):
-                    sc.configure("8.8.8.8", "root", 22, str(key), FP)
+                    sc.configure("8.8.8.8", "root", 22, str(key), host_fp)
             self.assertEqual(prior.read_bytes(), b"existing content unchanged\n")
             self.assertFalse((etc / "ssh_config").exists())
             self.assertFalse((etc / "known_hosts").exists())

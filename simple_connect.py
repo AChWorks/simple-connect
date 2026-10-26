@@ -11,6 +11,7 @@ import argparse
 import base64
 import errno
 import contextlib
+from dataclasses import dataclass
 import fcntl
 import hashlib
 import ipaddress
@@ -912,44 +913,175 @@ def validated_public_key(key: Path) -> Path:
     return pub
 
 
-def enroll_public_key() -> None:
-    """Opt-in remote authorized_keys enrollment; never modifies remote SSH daemon policy."""
+@dataclass(frozen=True)
+class EnrollmentIntent:
+    """The exact destination and SSH host identity for one operator consent."""
+    remote_ip: str
+    ssh_user: str
+    ssh_port: int
+    identity_file: str
+    host_record: bytes
+    host_fingerprint: str
+    config_revision: tuple[bytes | None, ...]
+
+
+def pinned_host_identity(cfg: dict, record: bytes) -> str:
+    """Validate one pinned ED25519 host-key line; return its OpenSSH SHA256."""
+    if not record or len(record) > 8192 or record.count(b"\n") != 1 or not record.endswith(b"\n"):
+        fail("Pinned SSH host key must contain exactly one record; run Configure SSH.")
+    try:
+        parts = record[:-1].decode("ascii").split()
+        expected_host = (cfg["remote_ip"] if cfg["ssh_port"] == 22
+                         else f"[{cfg['remote_ip']}]:{cfg['ssh_port']}")
+        if len(parts) != 3 or parts[0] != expected_host or parts[1] != "ssh-ed25519":
+            fail("Pinned SSH host key does not match the configured IP and port; run Configure SSH.")
+        raw = base64.b64decode(parts[2], validate=True)
+        if len(raw) < 32:
+            fail("Pinned ED25519 host key is malformed; run Configure SSH.")
+        return "SHA256:" + base64.b64encode(hashlib.sha256(raw).digest()).decode("ascii").rstrip("=")
+    except (UnicodeDecodeError, ValueError, base64.binascii.Error):
+        fail("Pinned SSH host key is invalid; run Configure SSH.")
+
+
+def read_pinned_host_record() -> bytes:
+    """Fail closed on mutable aliases, excessive content, or unsafe ownership."""
+    try:
+        fd = os.open(KNOWN_HOSTS, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        fail("Trusted SSH host key missing; run Configure SSH and verify the fingerprint first.")
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_size > 8192
+                or info.st_uid not in {0, os.geteuid()} or info.st_mode & 0o022):
+            fail("Pinned SSH host key file is unsafe; reconfigure the SSH endpoint.")
+        return os.read(fd, 8193)
+    finally:
+        os.close(fd)
+
+
+def current_enrollment_intent_unlocked() -> EnrollmentIntent:
+    """Caller holds manager lock; check consistent configuration and host pin."""
+    before = ssh_configuration_snapshot()
+    cfg = read_config()
+    host = read_pinned_host_record()
+    fingerprint = pinned_host_identity(cfg, host)
+    after = ssh_configuration_snapshot()
+    if before != after:
+        fail("SSH configuration changed while preparing enrollment; retry.")
+    return EnrollmentIntent(
+        remote_ip=cfg["remote_ip"], ssh_user=cfg["ssh_user"],
+        ssh_port=cfg["ssh_port"], identity_file=cfg["identity_file"],
+        host_record=host, host_fingerprint=fingerprint,
+        config_revision=after,
+    )
+
+
+def require_enrollment_intent_unlocked(intent: EnrollmentIntent) -> None:
+    """Never apply consent to another revision, destination, or host key."""
+    require_no_teardown()
+    if (read_json(STATE).get("status") != "DIRECT"
+            or not service_terminated() or any_proxy_tables()):
+        fail("Public-key enrollment requires verified DIRECT/OFF; inspect recovery.")
+    if (ssh_configuration_snapshot() != intent.config_revision
+            or current_enrollment_intent_unlocked() != intent):
+        fail("SSH destination, key or host identity changed after consent was prepared. "
+             "Nothing enrolled; reopen SSH Access and approve the current destination.")
+
+
+def enroll_public_key(intent: EnrollmentIntent | None = None) -> None:
+    """Opt-in enrollment bound to an immutable, independently pinned host key."""
     require_root()
     require_client_role()
     require_no_teardown()
-    cfg = read_config()
-    if not KNOWN_HOSTS.is_file() or KNOWN_HOSTS.is_symlink():
-        fail("Trusted SSH host key missing; run Configure SSH and verify its fingerprint first.")
-    with locked(wait_seconds=6):
-        state = read_json(STATE)
-        if state.get("status") != "DIRECT" or not service_terminated() or any_proxy_tables():
-            fail("Public-key enrollment requires verified DIRECT/OFF. Investigate recovery before changing SSH access.")
+    if intent is not None and not isinstance(intent, EnrollmentIntent):
+        fail("Invalid enrollment context; restart SSH setup.")
+    if intent is None:
+        with locked(wait_seconds=6):
+            require_no_teardown()
+            if (read_json(STATE).get("status") != "DIRECT"
+                    or not service_terminated() or any_proxy_tables()):
+                fail("Public-key enrollment requires verified DIRECT/OFF; inspect recovery.")
+            intent = current_enrollment_intent_unlocked()
+
     helper = Path("/usr/bin/ssh-copy-id")
     if not helper.is_file() or helper.is_symlink():
-        fail("ssh-copy-id unavailable. Install the Debian openssh-client package before enrolling.")
-    if "$" in cfg["ssh_user"]:
-        fail("Public-key enrollment helper rejects dollar signs in SSH usernames; use a different account or the trusted remote console.")
-    pub = validated_public_key(Path(cfg["identity_file"]))
-    # Re-open with O_NOFOLLOW immediately before handing this trusted,
-    # strictly one-line public key to the shell-based ssh-copy-id helper.
-    read_public_key_record(pub)
-    target = f"{cfg['ssh_user']}@{cfg['remote_ip']}"
-    say(f"Install ONLY the public key on {target}:{cfg['ssh_port']}.", "INFO")
-    say("Remote SSH may request its existing account password in this terminal; it is NOT stored.", "WARN")
-    cmd = [str(helper), "-i", str(pub), "-p", str(cfg["ssh_port"]),
-           "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
-           "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10",
-           target]
-    try:
-        result = subprocess.run(cmd, timeout=180, check=False,
-                                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root",
-                                     "TERM": os.environ.get("TERM", "dumb")})
-    except subprocess.TimeoutExpired:
-        fail("Public-key enrollment timed out. Confirm SSH port, credentials and remote login policy.")
-    if result.returncode:
-        fail(f"Public key enrollment failed (ssh-copy-id exit {result.returncode}). "
-             "The remote account may disallow password login; use its trusted console to authorize the displayed public key.")
-    say("Public key enrollment finished. Run Test SSH to verify it.", "OK")
+        fail("ssh-copy-id unavailable. Install Debian openssh-client before enrolling.")
+    if "$" in intent.ssh_user:
+        fail("Public-key enrollment cannot safely use '$' in SSH usernames; "
+             "use a different remote account or the trusted console.")
+
+    say(f"Public key destination: {intent.ssh_user}@{intent.remote_ip}:{intent.ssh_port}", "INFO")
+    say(f"SSH private identity: {intent.identity_file}", "INFO")
+    say(f"Independently pinned remote ED25519: {intent.host_fingerprint}", "INFO")
+    say("Only the corresponding PUBLIC key will be installed; no network interception.", "WARN")
+    if not yes_no(f"Authorize public-key enrollment on {intent.ssh_user}@{intent.remote_ip}:{intent.ssh_port}?"):
+        say("Public-key enrollment cancelled. No remote action taken.", "INFO")
+        return
+
+    # The consent prompt and all remote/password I/O occur without the lock.
+    with locked(wait_seconds=6):
+        require_enrollment_intent_unlocked(intent)
+
+    key = private_key_path(intent.identity_file)
+    pub = validated_public_key(key)
+    expected_record = read_public_key_record(pub)
+
+    # ssh-copy-id is a shell helper and reads files by pathname. Publish a
+    # temporary operator-private snapshot: its -i input, matching private
+    # identity, and verified known_hosts cannot be retargeted by a concurrent
+    # Configure SSH session after the manager lock is released.
+    with tempfile.TemporaryDirectory(prefix="sc-enroll-", dir=key.parent) as directory:
+        staged_dir = Path(directory)
+        trusted_key_parents(staged_dir)
+        staged_key = staged_dir / "identity"
+        staged_pub = staged_dir / "identity.pub"
+        staged_hosts = staged_dir / "known_hosts"
+        os.link(key, staged_key, follow_symlinks=False)
+        private_key_path(str(staged_key))
+        derived = run(["ssh-keygen", "-y", "-P", "", "-f", str(staged_key)], timeout=12)
+        if single_public_record(derived.stdout.encode("utf-8")) != expected_record:
+            fail("SSH private key changed before enrollment; no remote action taken.")
+        atomic_write(staged_pub, (" ".join(expected_record) + "\n").encode("ascii"), 0o644)
+        atomic_write(staged_hosts, intent.host_record, 0o600)
+        if read_public_key_record(staged_pub) != expected_record:
+            fail("Enrollment public key changed during preparation; refusing remote access.")
+        if pinned_host_identity({
+            "remote_ip": intent.remote_ip, "ssh_port": intent.ssh_port,
+        }, staged_hosts.read_bytes()) != intent.host_fingerprint:
+            fail("Pinned SSH host key changed during preparation; refusing remote access.")
+
+        # Final revision check immediately before the subprocess. If another
+        # configure commits after this check, command arguments still refer
+        # exclusively to this explicitly approved, immutable snapshot.
+        with locked(wait_seconds=6):
+            require_enrollment_intent_unlocked(intent)
+
+        say("Remote SSH may request the account password here; it is not stored.", "WARN")
+        cmd = [
+            str(helper), "-F", "/dev/null", "-i", str(staged_pub),
+            "-p", str(intent.ssh_port),
+            "-o", f"UserKnownHostsFile={staged_hosts}",
+            "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", "UpdateHostKeys=no",
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", "HostKeyAlgorithms=ssh-ed25519",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "ConnectTimeout=10",
+            f"{intent.ssh_user}@{intent.remote_ip}",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, timeout=180, check=False,
+                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+                     "HOME": "/root", "TERM": os.environ.get("TERM", "dumb")},
+            )
+        except subprocess.TimeoutExpired:
+            fail("Public-key enrollment timed out. Confirm SSH port, credentials and policy.")
+        if result.returncode:
+            fail(f"Public-key enrollment failed (ssh-copy-id exit {result.returncode}). "
+                 "Remote password login may be disabled; authorize the public key via its trusted console.")
+    say("Public-key enrollment finished. Run Test SSH to verify it.", "OK")
+
 
 
 def display_public_key() -> None:
@@ -1018,6 +1150,9 @@ def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
     if len(observed) < 2:
         fail("Could not read SSH host fingerprint.")
     actual = observed[1]
+    verified_host_record = (keys[0] + "\n").encode("ascii")
+    if pinned_host_identity(cfg, verified_host_record) != actual:
+        fail("Observed ED25519 fingerprint does not match the scanned host key; nothing saved.")
     say(f"Observed remote ED25519: {actual} (not yet trusted).", "WARN")
     print("  Obtain the trusted fingerprint from the REMOTE server console:")
     print("  ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub")
@@ -1053,13 +1188,20 @@ def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
         if ssh_configuration_snapshot() != prior_ssh:
             fail("SSH configuration changed during setup by another session. No changes saved; restart Configure SSH.")
         ETC.mkdir(parents=True, exist_ok=True)
-        atomic_write(KNOWN_HOSTS, (keys[0] + "\n").encode())
+        atomic_write(KNOWN_HOSTS, verified_host_record)
         atomic_write(SSH_CONF, sshcfg.encode())
         write_json(CONF, cfg)
+        # Capture A while holding the commit lock, before another operator
+        # can configure B. Consent must never be rebound to current globals.
+        enrollment_intent = EnrollmentIntent(
+            remote_ip=cfg["remote_ip"], ssh_user=cfg["ssh_user"],
+            ssh_port=cfg["ssh_port"], identity_file=cfg["identity_file"],
+            host_record=verified_host_record, host_fingerprint=actual,
+            config_revision=ssh_configuration_snapshot(),
+        )
     say("Remote identity pinned and configuration saved. Network remains DIRECT/OFF.", "OK")
     if interactive:
-        if yes_no("Install this CLIENT public key on the remote SSH account now?"):
-            enroll_public_key()
+        enroll_public_key(enrollment_intent)
         if yes_no("Test the remote SSH login and Python prerequisites now?", default=True):
             remote_python_test()
         say("Use Test HTTPS for full traffic checks before considering ON.", "INFO")
