@@ -674,5 +674,143 @@ class CliOnboardingTests(unittest.TestCase):
         self.assertTrue(all(len(row) <= 39 for row in output.getvalue().splitlines()))
 
 
+
+class StatusOwnershipColorsTests(unittest.TestCase):
+    """Privileged status labels never imply ownership from table presence alone."""
+
+    def test_active_and_pending_owned_table_identity_matrix(self):
+        table = {"nftables": [
+            {"metainfo": {"version": "1.1.3"}},
+            {"table": {"family": "inet", "name": "sshuttle-ipv4-23456", "handle": 1}},
+        ]}
+        good_sha = sc.table_hash(table)
+        # Both state labels must display explicit ownership even if the old
+        # persisted fingerprint is missing, invalid or changed.
+        cases = (
+            ("missing-hash", {}, table, "present", "UNVERIFIED (no saved SHA256)", "warn"),
+            ("empty-hash", {"table_sha256": ""}, table, "present",
+             "UNVERIFIED (no saved SHA256)", "warn"),
+            ("invalid-hash", {"table_sha256": None}, table, "present",
+             "UNVERIFIED (no saved SHA256)", "warn"),
+            ("changed", {"table_sha256": "f" * 64}, table, "present", "CHANGED", "error"),
+            ("match", {"table_sha256": good_sha}, table, "present", "MATCH", "good"),
+            ("absent", {"table_sha256": good_sha}, None, "absent", "ABSENT", "error"),
+        )
+        color = {"good": "\033[1;32m", "warn": "\033[1;33m", "error": "\033[1;31m"}
+        for label in ("ACTIVE", "PENDING"):
+            for name, saved, observed, table_text, identity, tone in cases:
+                with self.subTest(state=label, case=name), tempfile.TemporaryDirectory() as d:
+                    role = Path(d) / "role"
+                    role.write_text("client\n")
+                    state = {"status": label, "listen_port": 23456, **saved}
+                    with (
+                        patch.object(sc, "ETC", Path(d)),
+                        patch.object(sc, "read_json", return_value=state),
+                        patch.object(sc, "is_active", return_value=True),
+                        patch.object(sc.shutil, "which", return_value="/usr/sbin/nft"),
+                        patch.object(sc, "current_table", return_value=observed) as lookup,
+                        patch.object(sc, "run", side_effect=AssertionError("run in status")) as run,
+                        patch.object(sc, "write_json", side_effect=AssertionError("state write")) as write,
+                        patch.object(sc, "unit_action", side_effect=AssertionError("unit action")) as unit,
+                        patch.object(sc, "owned_cleanup", side_effect=AssertionError("nft delete")) as cleanup,
+                        patch.object(sc, "any_proxy_tables", side_effect=AssertionError("table scan")),
+                        patch.object(sc.shutil, "get_terminal_size",
+                                     return_value=os.terminal_size((80, 24))),
+                    ):
+                        with patch.dict(os.environ, {"TERM": "xterm-256color"}, clear=True), (
+                             patch.object(sc.sys, "stdout", TerminalBuffer())) as tty:
+                            sc.status()
+                        raw = tty.getvalue()
+                        self.assertIn(color[tone] + table_text + "\033[0m", raw)
+                        self.assertIn(color[tone] + identity + "\033[0m", raw)
+                        if label == "ACTIVE":
+                            self.assertIn(color[tone] + "ACTIVE\033[0m", raw)
+                        if tone != "good":
+                            self.assertNotIn(color["good"] + "present\033[0m", raw)
+                        if name in ("missing-hash", "empty-hash", "invalid-hash", "changed"):
+                            self.assertIn("WARNING:", raw)
+                            unstyled = re.sub(r"\x1b\[[0-9;]*m", "", raw)
+                            self.assertIn("do not adopt or delete",
+                                          " ".join(unstyled.split()))
+                        with patch.dict(os.environ, {"TERM": "xterm", "NO_COLOR": "1"},
+                                        clear=True), (
+                             patch.object(sc.sys, "stdout", TerminalBuffer())) as plain:
+                            sc.status()
+                        text = plain.getvalue()
+                        self.assertNotIn("\033[", text)
+                        self.assertIn("Owned nftables table: " + table_text, text)
+                        self.assertIn("Table identity: " + identity, text)
+                        lookup.assert_called_with(state)
+                        self.assertEqual(lookup.call_count, 2)
+                        run.assert_not_called()
+                        write.assert_not_called()
+                        unit.assert_not_called()
+                        cleanup.assert_not_called()
+
+    def test_unverified_firewall_warning_wraps_at_40_columns(self):
+        table = {"nftables": [{"table": {"family": "inet",
+                                          "name": "sshuttle-ipv4-23456"}}]}
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "role").write_text("client\n")
+            with (
+                patch.object(sc, "ETC", Path(d)),
+                patch.object(sc, "read_json", return_value={
+                    "status": "PENDING", "listen_port": 23456,
+                }),
+                patch.object(sc, "is_active", return_value=True),
+                patch.object(sc.shutil, "which", return_value="/usr/sbin/nft"),
+                patch.object(sc, "current_table", return_value=table),
+                patch.object(sc.shutil, "get_terminal_size",
+                             return_value=os.terminal_size((40, 25))),
+                patch.object(sc.sys, "stdout", TerminalBuffer()) as output,
+                patch.dict(os.environ, {"TERM": "xterm"}, clear=True),
+            ):
+                sc.status()
+            raw = output.getvalue()
+            plain = re.sub(r"\x1b\[[0-9;]*m", "", raw)
+            self.assertIn("UNVERIFIED", plain)
+            self.assertIn("\033[1;33m", raw)
+            self.assertTrue(all(len(line) <= 39 for line in plain.splitlines()),
+                            plain)
+
+    def test_missing_nft_cannot_claim_verified_firewall(self):
+        for label in ("ACTIVE", "PENDING", "DIRECT"):
+            with self.subTest(state=label), tempfile.TemporaryDirectory() as d:
+                (Path(d) / "role").write_text("client\n")
+                with (
+                    patch.object(sc, "ETC", Path(d)),
+                    patch.object(sc, "read_json", return_value={"status": label}),
+                    patch.object(sc, "is_active", return_value=label != "DIRECT"),
+                    patch.object(sc.shutil, "which", return_value=None),
+                    patch.object(sc, "current_table", side_effect=AssertionError("nft missing")) as lookup,
+                    patch.object(sc, "any_proxy_tables", side_effect=AssertionError("nft missing")),
+                    patch.object(sc.sys, "stdout", TerminalBuffer()) as output,
+                    patch.dict(os.environ, {"TERM": "xterm"}, clear=True),
+                ):
+                    sc.status()
+                    lookup.assert_not_called()
+                self.assertIn("\033[1;33mUNVERIFIED", output.getvalue())
+                self.assertNotIn("\033[1;32mabsent\033[0m", output.getvalue())
+
+    def test_direct_untracked_firewall_is_not_green(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "role").write_text("client\n")
+            with (
+                patch.object(sc, "ETC", Path(d)),
+                patch.object(sc, "read_json", return_value={"status": "DIRECT"}),
+                patch.object(sc, "is_active", return_value=False),
+                patch.object(sc.shutil, "which", return_value="/usr/sbin/nft"),
+                patch.object(sc, "any_proxy_tables", return_value=True) as scan,
+                patch.object(sc, "current_table", side_effect=AssertionError("direct table lookup")),
+                patch.object(sc.sys, "stdout", TerminalBuffer()) as output,
+                patch.dict(os.environ, {"TERM": "xterm"}, clear=True),
+            ):
+                sc.status()
+            scan.assert_called_once_with()
+            self.assertIn("\033[1;31muntracked table(s) present\033[0m", output.getvalue())
+            self.assertIn("WARNING: Untracked sshuttle", output.getvalue())
+            self.assertNotIn("\033[1;32mabsent\033[0m", output.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

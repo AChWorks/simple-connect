@@ -2331,9 +2331,29 @@ def status() -> None:
         fail("Unknown Simple Connect role; inspect role file, no network state inferred.")
     state = read_json(STATE, {"status": "UNKNOWN"})
     label = str(state.get("status", "UNKNOWN"))
-    tone = "good" if label in ("DIRECT", "ACTIVE") else "warn" if label == "PENDING" else "error"
     active = is_active(SERVICE)
     guard_active = is_active(GUARD_TIMER)
+    nft_available = shutil.which("nft") is not None
+    table = current_table(state) if nft_available and label != "DIRECT" else None
+    untracked = any_proxy_tables() if label == "DIRECT" and nft_available else False
+    expected_sha = state.get("table_sha256")
+    verified_table = (table is not None and isinstance(expected_sha, str)
+                      and table_is_ours(table, expected_sha))
+    # ACTIVE is a persisted state label, not proof of safe firewall ownership.
+    # Do not give that overall label a green health cue while the observation
+    # is unverifiable, changed, missing, or the service/guard is unhealthy.
+    if label == "ACTIVE":
+        if not active or not guard_active or (nft_available and table is None):
+            tone = "error"
+        elif not nft_available or not isinstance(expected_sha, str) or not expected_sha:
+            tone = "warn"
+        else:
+            tone = "good" if verified_table else "error"
+    elif label == "DIRECT":
+        tone = ("error" if untracked or active else
+                "good" if nft_available and guard_active else "warn")
+    else:
+        tone = "warn" if label == "PENDING" else "error"
     print(f"Simple Connect: {VERSION}")
     terminal_section("CONNECTION")
     terminal_field("Role", "CLIENT")
@@ -2347,18 +2367,39 @@ def status() -> None:
     terminal_section("RECOVERY / OWNED FIREWALL")
     terminal_field("Independent guard", "running" if guard_active else "not active",
                    tone="good" if guard_active else "warn")
-    table = current_table(state) if shutil.which("nft") and label != "DIRECT" else None
-    table_state = "present" if table else "absent"
-    expected_table = (table is not None) if label in ("ACTIVE", "PENDING") else (
-        table is None if label == "DIRECT" else None)
-    terminal_field("Owned nftables table", table_state,
-                   tone="good" if expected_table else "error" if expected_table is False else None)
-    if label == "DIRECT" and shutil.which("nft") and any_proxy_tables():
-        terminal_warning("Untracked sshuttle nftables table(s) present; inspect manually.")
-    if table and state.get("table_sha256"):
-        matches = table_is_ours(table, state["table_sha256"])
-        terminal_field("Table identity", "MATCH" if matches else "CHANGED",
-                       tone="good" if matches else "error")
+    if label == "DIRECT":
+        # Absence is only a healthy observation after an actual nft inspection.
+        if not nft_available:
+            terminal_field("Owned nftables table", "UNVERIFIED (nft unavailable)", tone="warn")
+        else:
+            terminal_field("Owned nftables table",
+                           "untracked table(s) present" if untracked else "absent",
+                           tone="error" if untracked else "good")
+            if untracked:
+                terminal_warning("Untracked sshuttle nftables table(s) present; inspect manually.")
+    elif not nft_available:
+        terminal_field("Owned nftables table", "UNVERIFIED (nft unavailable)", tone="warn")
+        terminal_field("Table identity", "UNVERIFIED (cannot inspect)", tone="warn")
+    elif table is None:
+        terminal_field("Owned nftables table", "absent", tone="error")
+        terminal_field("Table identity", "ABSENT", tone="error")
+    else:
+        # A matching table name proves presence only, never ownership. Do not
+        # show green unless the *full* persisted snapshot hash verifies.
+        if not isinstance(expected_sha, str) or not expected_sha:
+            identity, table_tone = "UNVERIFIED (no saved SHA256)", "warn"
+        elif verified_table:
+            identity, table_tone = "MATCH", "good"
+        else:
+            identity, table_tone = "CHANGED", "error"
+        terminal_field("Owned nftables table", "present", tone=table_tone)
+        terminal_field("Table identity", identity, tone=table_tone)
+        if identity.startswith("UNVERIFIED"):
+            terminal_warning("Table ownership cannot be verified without a recorded SHA256; "
+                             "do not adopt or delete it.")
+        elif identity == "CHANGED":
+            terminal_warning("Table differs from recorded ownership SHA256; "
+                             "do not adopt or delete it.")
     if label == "PENDING":
         terminal_field("Confirmation operation", str(state.get("op")))
         terminal_field("Confirmation expires at UTC timestamp", str(state.get("deadline")))
