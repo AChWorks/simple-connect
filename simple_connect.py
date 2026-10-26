@@ -696,14 +696,18 @@ SAFE_KEY_PATH = re.compile(r"/[A-Za-z0-9_./-]+")
 
 
 def checked_key_name(value: str) -> Path:
-    if value.strip().upper().startswith("SHA256:"):
+    stripped = value.strip()
+    if stripped.upper().startswith("SHA256:"):
         fail("That SHA256 value is the SERVER host fingerprint, not a CLIENT "
              "private-key file path. Enter an absolute path to a private key "
              "on this CLIENT (for example /root/.ssh/simple_connect_ed25519). "
              "The SERVER fingerprint is requested separately in step 5.")
-    if value.strip().startswith(("ssh-ed25519 ", "ssh-rsa ", "ecdsa-sha2-")):
+    if stripped.lower().startswith(("ssh-", "ecdsa-sha2-", "sk-")):
         fail("That is SSH PUBLIC key text, not a CLIENT private-key file path. "
              "Enter the path to your existing local private key.")
+    if stripped.upper().startswith(("-----BEGIN ", "-----END ")):
+        fail("That is SSH key CONTENT, not a CLIENT private-key file path. "
+             "Never paste a private key here; enter only its absolute filename.")
     path = Path(value)
     if (not path.is_absolute() or not SAFE_KEY_PATH.fullmatch(value)
             or any(part in (".", "..") for part in value.split("/"))):
@@ -849,9 +853,21 @@ def select_identity(explicit: str | None) -> str:
             if chosen.strip().upper().startswith("SHA256:"):
                 say("Keep that SERVER fingerprint for step 5. Step 4 needs a CLIENT file path.", "INFO")
                 continue
-            missing = not Path(chosen).exists() and not Path(chosen).is_symlink()
-            if missing and yes_no(f"Generate a dedicated CLIENT key at {KEY_PATH}?", default=True):
-                return str(create_dedicated_key())
+            # Only a syntactically valid absolute filename may lead to an
+            # *optional* dedicated-key offer. A fingerprint, pasted key,
+            # relative/unsafe pathname or an existing unsafe file must never
+            # become implicit consent to create a new credential.
+            try:
+                candidate = checked_key_name(chosen)
+            except ConnectError:
+                say("Enter a valid CLIENT private-key FILE path, or b to cancel.", "INFO")
+                continue
+            if not candidate.exists() and not candidate.is_symlink():
+                if candidate != KEY_PATH:
+                    terminal_note(f"The missing path {candidate} will NOT be created. "
+                                  f"Key generation uses only {KEY_PATH}.")
+                if yes_no(f"Generate a NEW dedicated CLIENT key at {KEY_PATH}?", default=False):
+                    return str(create_dedicated_key())
             say("Enter another existing CLIENT key path, or b to cancel.", "INFO")
 
 
@@ -1985,7 +2001,7 @@ def server_host_report(*, probe: bool = False) -> dict:
         path = Path(item + ".pub")
         entry = {"path": str(path), "type": "UNKNOWN", "fingerprint": "",
                  "status": "PUBLIC KEY MISSING", "private": "NOT VERIFIED",
-                 "enabled": False}
+                 "enabled": False, "observed_ports": []}
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
             try:
@@ -2070,26 +2086,48 @@ def server_host_report(*, probe: bool = False) -> dict:
     if not any(item["enabled"] for item in report["keys"]):
         report["notes"].append("No verified configured supported host identity; check sshd config and keys.")
     if probe and report["ports"]:
-        # This is an unprivileged read-only observation; it never generates a
-        # key, changes sshd, or connects to any non-local address.
-        local = {entry["type"]: entry for entry in report["keys"]
-                 if entry["enabled"] and entry["fingerprint"]}
+        # This read-only loopback observation is exact (port, algorithm,
+        # fingerprint). A type-only dictionary silently loses a key when
+        # sshd config has multiple HostKey entries of the same algorithm.
+        if len(report["ports"]) > 4:
+            report["notes"].append("Only the first four configured SSH ports were probed.")
         for port in report["ports"][:4]:
             try:
                 result = run(["ssh-keyscan", "-4", "-T", "3",
                               "-t", "ed25519,ecdsa,rsa", "-p", str(port),
                               "127.0.0.1"], check=False, timeout=12)
-                seen = []
+                seen: set[tuple[str, str]] = set()
                 for row in result.stdout.splitlines():
                     fields = row.split()
                     if not row or row.startswith("#") or len(fields) != 3:
                         continue
                     kind = fields[1]
-                    if kind in local and host_key_fingerprint(kind, fields[2]) == local[kind]["fingerprint"]:
-                        local[kind]["status"] = "OBSERVED on localhost; signature negotiation not yet tested"
-                        seen.append(kind)
+                    if kind not in HOST_KEY_ALGORITHMS:
+                        continue
+                    try:
+                        fingerprint = host_key_fingerprint(kind, fields[2])
+                    except ConnectError as exc:
+                        report["notes"].append(f"Invalid local SSH host-key scan at port {port}: {exc}")
+                        continue
+                    matched = [entry for entry in report["keys"]
+                               if entry["enabled"] and entry["type"] == kind
+                               and entry["fingerprint"] == fingerprint]
+                    if not matched:
+                        report["notes"].append(
+                            f"Unmatched localhost:{port} {kind} identity; do not trust by type alone.")
+                        continue
+                    for entry in matched:
+                        entry["observed_ports"].append(port)
+                        observed_at = ", ".join(map(str, entry["observed_ports"]))
+                        entry["status"] = (f"OBSERVED exact fingerprint on localhost port(s): "
+                                           f"{observed_at}; signature negotiation not yet tested")
+                    seen.add((kind, fingerprint))
                 if seen:
-                    report["observed"].append({"port": port, "types": seen})
+                    report["observed"].append({
+                        "port": port,
+                        "identities": [{"type": kind, "fingerprint": fingerprint}
+                                       for kind, fingerprint in sorted(seen)],
+                    })
                 else:
                     report["notes"].append(f"No matching key observed on localhost:{port}; external-only listeners may differ.")
             except (ConnectError, OSError) as exc:
@@ -2130,14 +2168,33 @@ def show_server_host_fingerprints(*, probe: bool = True, advanced: bool = False)
 
     ready = [entry for entry in info["keys"]
              if entry["enabled"] and entry["fingerprint"]]
-    observed = {kind for item in info["observed"] for kind in item["types"]}
-    # Prefer an identity actually seen on localhost when a probe found any;
-    # never imply that other locally configured keys were offered.
-    if probe and any(entry["type"] in observed for entry in ready):
-        ready = [entry for entry in ready if entry["type"] in observed]
+    observed_ports: dict[tuple[str, str], set[int]] = {}
+    for scan in info["observed"]:
+        for identity in scan["identities"]:
+            pair = (identity["type"], identity["fingerprint"])
+            observed_ports.setdefault(pair, set()).add(scan["port"])
+    # Prefer the exact identity locally offered, never merely its algorithm.
+    if probe and any((entry["type"], entry["fingerprint"]) in observed_ports for entry in ready):
+        ready = [entry for entry in ready
+                 if (entry["type"], entry["fingerprint"]) in observed_ports]
     ranking = {kind: index for index, kind in enumerate(HOST_KEY_ORDER)}
-    ready.sort(key=lambda entry: ranking.get(entry["type"], len(ranking)))
-    if ready:
+    ready.sort(key=lambda entry: (ranking.get(entry["type"], len(ranking)),
+                                  entry["fingerprint"], entry["path"]))
+    best = ([entry for entry in ready
+             if ranking.get(entry["type"], len(ranking)) ==
+                ranking.get(ready[0]["type"], len(ranking))] if ready else [])
+    # Multiple different keys of the preferred algorithm, even on separate
+    # ports, have no unambiguous default CLIENT fingerprint. A caller must
+    # choose the exact verified identity for the intended listener.
+    ambiguous = len({(entry["type"], entry["fingerprint"]) for entry in best}) > 1
+    if ambiguous:
+        terminal_note("WARNING: AMBIGUOUS SERVER identity: multiple distinct "
+                      "keys of the preferred algorithm. No single fingerprint "
+                      "can be recommended for all listeners.")
+        terminal_note("Inspect Advanced for exact fingerprints and observed "
+                      "localhost ports. Verify the intended SERVER port and "
+                      "its specific identity before configuring the CLIENT.")
+    elif ready:
         selected = ready[0]
         kind = selected["type"]
         friendly = ("ED25519 (ssh-ed25519)" if kind == "ssh-ed25519" else
@@ -2145,8 +2202,10 @@ def show_server_host_fingerprints(*, probe: bool = True, advanced: bool = False)
                     "ECDSA (" + kind + ")")
         terminal_note(f"Recommended SERVER host key: {friendly}")
         print(selected["fingerprint"])  # One complete, directly copyable token.
-        if probe and kind in observed:
-            terminal_note("Matched on localhost only. External SSH reachability "
+        ports = sorted(observed_ports.get((kind, selected["fingerprint"]), set()))
+        if probe and ports:
+            terminal_note("Exact fingerprint matched on localhost port(s): "
+                          + ", ".join(map(str, ports)) + ". External SSH reachability "
                           "and authenticated signature negotiation are UNVERIFIED.")
         else:
             terminal_note("Verified configured local key pair only. The SSH "

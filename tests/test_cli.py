@@ -101,17 +101,86 @@ class CliOnboardingTests(unittest.TestCase):
             with self.assertRaisesRegex(sc.ConnectError, "does not match"):
                 sc.validated_public_key(key)
 
-    def test_select_identity_may_generate_only_on_explicit_interactive_confirmation(self):
+    def test_select_identity_never_generates_on_blank_or_negative_consent(self):
         with tempfile.TemporaryDirectory() as d:
             key = Path(d) / ".ssh" / "simple_connect_ed25519"
-            with patch.object(sc, "KEY_PATH", key), patch.object(sc, "require_root"):
-                with patch.object(sc.sys, "stdin", TTY()), patch("builtins.input", side_effect=["", ""]):
-                    self.assertEqual(sc.select_identity(None), str(key))
-                self.assertTrue(key.is_file())
-                with patch.object(sc, "create_dedicated_key") as generator:
-                    with self.assertRaisesRegex(sc.ConnectError, "Identity file"):
-                        sc.select_identity(str(Path(d) / "missing"))
+            with (
+                patch.object(sc, "KEY_PATH", key),
+                patch.object(sc, "require_root"),
+                patch.object(sc.sys, "stdin", TTY()),
+                patch.object(sc, "create_dedicated_key") as generator,
+            ):
+                for answer in ("", "n", "no", "back"):
+                    with self.subTest(answer=answer):
+                        with patch("builtins.input", side_effect=["", answer, "b"]), (
+                             contextlib.redirect_stdout(io.StringIO())):
+                            with self.assertRaisesRegex(sc.ConnectError, "cancelled"):
+                                sc.select_identity(None)
+                        generator.assert_not_called()
+                        self.assertFalse(key.exists())
+                with self.assertRaisesRegex(sc.ConnectError, "Identity file"):
+                    sc.select_identity(str(Path(d) / "missing"))
+                generator.assert_not_called()
+
+    def test_select_identity_explicit_yes_creates_only_dedicated_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            key = Path(d) / ".ssh" / "simple_connect_ed25519"
+            alternate_missing = Path(d) / "another-missing-key"
+            with (
+                patch.object(sc, "KEY_PATH", key),
+                patch.object(sc, "require_root"),
+                patch.object(sc.sys, "stdin", TTY()),
+                patch("builtins.input", side_effect=[str(alternate_missing), "y"]),
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
+                self.assertEqual(sc.select_identity(None), str(key))
+            self.assertTrue(key.is_file())
+            self.assertTrue(Path(str(key) + ".pub").is_file())
+            self.assertFalse(alternate_missing.exists())
+            self.assertIn("will NOT be created", out.getvalue())
+            data = key.read_bytes()
+            with patch.object(sc, "require_root"), patch.object(sc, "KEY_PATH", key):
+                with self.assertRaisesRegex(sc.ConnectError, "already exists"):
+                    sc.create_dedicated_key()
+            self.assertEqual(key.read_bytes(), data)
+
+    def test_pasted_key_material_and_bad_paths_cannot_offer_generation(self):
+        with tempfile.TemporaryDirectory() as d:
+            key = Path(d) / ".ssh" / "simple_connect_ed25519"
+            with (
+                patch.object(sc, "KEY_PATH", key),
+                patch.object(sc.sys, "stdin", TTY()),
+                patch.object(sc, "create_dedicated_key") as generator,
+                patch.object(sc, "yes_no", side_effect=AssertionError("Invalid input asked for key generation")),
+            ):
+                for invalid in (FP, "ssh-ed25519 AAAA forged", "ssh-rsa AAAA",
+                                "-----BEGIN OPENSSH PRIVATE KEY-----",
+                                "-----BEGIN RSA PRIVATE KEY-----", "./missing",
+                                "missing", "../relative", "/tmp/../bad"):
+                    with self.subTest(invalid=invalid), (
+                         patch("builtins.input", side_effect=[invalid, "b"])), (
+                         contextlib.redirect_stdout(io.StringIO())):
+                        with self.assertRaisesRegex(sc.ConnectError, "cancelled"):
+                            sc.select_identity(None)
                     generator.assert_not_called()
+                    self.assertFalse(key.exists())
+
+    def test_invalid_input_retry_selects_existing_key_without_generation(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            existing = self.make_key(folder)
+            new = folder / ".ssh" / "simple_connect_ed25519"
+            with (
+                patch.object(sc, "KEY_PATH", new),
+                patch.object(sc.sys, "stdin", TTY()),
+                patch("builtins.input", side_effect=["./missing", FP, "ssh-ed25519 AAAA", str(existing)]),
+                patch.object(sc, "create_dedicated_key") as generator,
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
+                self.assertEqual(sc.select_identity(None), str(existing))
+                generator.assert_not_called()
+            self.assertIn("SERVER fingerprint", out.getvalue())
+            self.assertFalse(new.exists())
 
     def test_server_fingerprint_pasted_as_client_path_is_rejected_and_recoverable(self):
         with self.assertRaisesRegex(sc.ConnectError, "SERVER host fingerprint"):
