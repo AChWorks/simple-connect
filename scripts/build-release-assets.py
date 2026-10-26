@@ -38,7 +38,18 @@ def pinned(source: str, name: str) -> str:
     return value.group(1)
 
 
+def verify_output_parent() -> None:
+    # Output must be the physical dist/ child of this source checkout,
+    # never a symlink to a different (possibly live-served) directory.
+    require(
+        DIST.is_dir() and not DIST.is_symlink()
+        and DIST.resolve(strict=True) == ROOT.resolve() / "dist",
+        "Unsafe dist output directory: expected physical checkout-local dist/.",
+    )
+
+
 def verify_inputs() -> dict[str, bytes]:
+    verify_output_parent()
     require(MIRROR.is_dir() and not MIRROR.is_symlink(), "Mirror directory is missing or unsafe.")
     require(
         {p.name for p in MIRROR.iterdir()} == set(CONTENTS),
@@ -62,6 +73,13 @@ def verify_inputs() -> dict[str, bytes]:
     require(set(checksums) == set(HASHED), "SHA256SUMS payload list mismatch.")
     for name in HASHED:
         require(checksums[name] == sha256(files[name]), f"Checksum mismatch: {name}")
+
+    # A stale but internally valid staged bundle must not be released from
+    # a different checkout. The mirror builder supplies the matching bytes.
+    for name in ("install.sh", "simple_connect.py"):
+        source = ROOT / name
+        require(source.is_file() and not source.is_symlink(), f"Unsafe checkout source: {name}")
+        require(files[name] == source.read_bytes(), f"Staged {name} differs from checked-out source.")
 
     manager = files["simple_connect.py"].decode("utf-8")
     bootstrap = files["install.sh"].decode("utf-8")
@@ -96,6 +114,7 @@ def temporary_file() -> Path:
 
 
 def build(files: dict[str, bytes]) -> str:
+    verify_output_parent()
     for dest in (ARCHIVE, SIDECAR):
         require(
             not dest.is_symlink() and (not dest.exists() or dest.is_file()),

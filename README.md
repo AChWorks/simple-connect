@@ -63,11 +63,13 @@ python3 scripts/build-release-assets.py
 ~~~
 
 The release archive contains exactly the same four flat files, including
-the official wheel's upstream license. The archive builder rejects a
-`-dev` version, mismatched checksums, missing licensing and unexpected
-mirror entries. It uses fixed ZIP metadata and no compression for stable
-byte-for-byte archives. CI checks repeatability and uploads the pair as
-**temporary** artifacts; these are not a public GitHub Release. Publish
+the official wheel's upstream license. Both builders reject a symlinked
+`dist/` parent to avoid redirecting output outside this checkout; the
+release builder also requires staged manager and installer files to match
+the checked-out sources. It rejects a `-dev` version, mismatched checksums,
+missing licensing and unexpected mirror entries. It uses fixed ZIP metadata
+and no compression for stable byte-for-byte archives. CI checks repeatability
+and uploads the pair as **temporary** artifacts; these are not a public GitHub Release. Publish
 the matching tag and two permanent Release assets only after explicit
 Owner authorization and relevant review/CI gates. Extraction and hosting
 the four files on a trusted custom HTTPS mirror remain operator-controlled.
