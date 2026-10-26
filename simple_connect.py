@@ -21,6 +21,8 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import struct
+import textwrap
 import shlex
 import shutil
 import socket
@@ -31,7 +33,7 @@ import time
 import urllib.request
 import zipfile
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 SCHEMA_VERSION = 1
 SSHUTTLE_VERSION = "2.0.0"
 WHEEL_SHA256 = "506a8cad2f047ca42f0d784654cb3459e2193bfad79d0a03734e0e07473f2bbb"
@@ -66,6 +68,21 @@ EXCLUDED = (
 
 
 KEY_PATH = Path("/root/.ssh/simple_connect_ed25519")
+# RSA host public keys are encoded as ssh-rsa even when the SSH host-key
+# SIGNATURE is rsa-sha2-512/256. Never permit the legacy ssh-rsa SHA-1
+# signature algorithm in any connection.
+HOST_KEY_ALGORITHMS = {
+    "ssh-ed25519": "ssh-ed25519",
+    "ecdsa-sha2-nistp256": "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384": "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521": "ecdsa-sha2-nistp521",
+    "ssh-rsa": "rsa-sha2-512,rsa-sha2-256",
+}
+HOST_KEY_ORDER = tuple(HOST_KEY_ALGORITHMS)
+SSH_HOST_DIR = Path("/etc/ssh")
+# Never execute an sshd discovered through a potentially user-controlled PATH
+# while displaying root-only server diagnostics.
+SSH_DAEMON = Path("/usr/sbin/sshd")
 COLORS = {
     "title": "\033[1;34m", "heading": "\033[1;36m",
     "good": "\033[1;32m", "warn": "\033[1;33m",
@@ -100,7 +117,7 @@ def guidance(message: str) -> str:
     if "identity file" in lower or "private key" in lower or "permission" in lower and "key" in lower:
         return "Open Configure SSH to select or create a dedicated SSH key. Never paste a private key into a prompt."
     if "fingerprint" in lower or "host key" in lower:
-        return "Check the remote ED25519 fingerprint from its trusted console; do not accept an unknown host key."
+        return "Use the SERVER fingerprint action on its trusted console; verify the exact selected host key out of band."
     if "permission denied" in lower or "publickey" in lower or "password" in lower and "ssh" in lower:
         return "Use SSH key access in the menu to enroll the public key; remote SSH policy may disallow passwords."
     if "timed out" in lower or "connection refused" in lower or "no route to host" in lower:
@@ -585,13 +602,8 @@ def setup(role: str, wheel_url: str) -> None:
     ETC.mkdir(mode=0o700, parents=True, exist_ok=True)
     atomic_write(role_path, (role + "\n").encode())
     if role == "server":
-        host_key = Path("/etc/ssh/ssh_host_ed25519_key.pub")
-        if host_key.is_file():
-            fingerprint = run(["ssh-keygen", "-lf", str(host_key)]).stdout.strip()
-            say(f"Remote SSH ED25519 host identity (verify using trusted console): {fingerprint}", "OK")
-        if not is_active("ssh.service") and not is_active("sshd.service"):
-            say("SSH server is not confirmed active. Configure SSH service and credentials before connecting.", "WARN")
-        say("Server role ready. No public proxy, tunnel, account or firewall rule created.", "OK")
+        show_server_host_fingerprints(probe=False)
+        say("SERVER role installed; SSH readiness is separately verified. No proxy, account or firewall created.", "OK")
         return
     install_wheel(wheel_url)
     ETC.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -925,23 +937,88 @@ class EnrollmentIntent:
     config_revision: tuple[bytes | None, ...]
 
 
-def pinned_host_identity(cfg: dict, record: bytes) -> str:
-    """Validate one pinned ED25519 host-key line; return its OpenSSH SHA256."""
+def host_key_signature_algorithms(key_type: str) -> str:
+    try:
+        return HOST_KEY_ALGORITHMS[key_type]
+    except KeyError:
+        fail(f"Unsupported or obsolete SSH host key type: {key_type}. DSA and RSA-SHA1 are refused.")
+
+
+def host_key_fingerprint(key_type: str, encoded: str) -> str:
+    """Check key blob's SSH wire type, not merely the untrusted text label."""
+    host_key_signature_algorithms(key_type)
+    if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", encoded):
+        fail("SSH host key contains invalid base64.")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+        if len(raw) < 32 or len(raw) > 8192:
+            fail("SSH host key has an invalid length.")
+        (length,) = struct.unpack(">I", raw[:4])
+        if not 1 <= length <= 64 or len(raw) <= 4 + length:
+            fail("SSH host key wire format is invalid.")
+        if raw[4:4 + length].decode("ascii") != key_type:
+            fail("SSH host key type differs from the encoded key material.")
+        return "SHA256:" + base64.b64encode(hashlib.sha256(raw).digest()).decode("ascii").rstrip("=")
+    except (UnicodeDecodeError, ValueError, struct.error, base64.binascii.Error):
+        fail("SSH host key wire encoding is invalid.")
+
+
+def pinned_host_type(record: bytes) -> str:
     if not record or len(record) > 8192 or record.count(b"\n") != 1 or not record.endswith(b"\n"):
         fail("Pinned SSH host key must contain exactly one record; run Configure SSH.")
     try:
         parts = record[:-1].decode("ascii").split()
-        expected_host = (cfg["remote_ip"] if cfg["ssh_port"] == 22
-                         else f"[{cfg['remote_ip']}]:{cfg['ssh_port']}")
-        if len(parts) != 3 or parts[0] != expected_host or parts[1] != "ssh-ed25519":
-            fail("Pinned SSH host key does not match the configured IP and port; run Configure SSH.")
-        raw = base64.b64decode(parts[2], validate=True)
-        if len(raw) < 32:
-            fail("Pinned ED25519 host key is malformed; run Configure SSH.")
-        return "SHA256:" + base64.b64encode(hashlib.sha256(raw).digest()).decode("ascii").rstrip("=")
-    except (UnicodeDecodeError, ValueError, base64.binascii.Error):
-        fail("Pinned SSH host key is invalid; run Configure SSH.")
+    except UnicodeDecodeError:
+        fail("Pinned SSH host key must use ASCII.")
+    if len(parts) != 3:
+        fail("Pinned SSH host key is not a single plain record.")
+    host_key_fingerprint(parts[1], parts[2])
+    return parts[1]
 
+
+def pinned_host_identity(cfg: dict, record: bytes) -> str:
+    """Validate the single exact endpoint and supported host identity."""
+    key_type = pinned_host_type(record)
+    parts = record[:-1].decode("ascii").split()
+    expected_host = (cfg["remote_ip"] if cfg["ssh_port"] == 22
+                     else f"[{cfg['remote_ip']}]:{cfg['ssh_port']}")
+    if parts[0] != expected_host:
+        fail("Pinned SSH host key does not match the configured IP and port; run Configure SSH.")
+    return host_key_fingerprint(key_type, parts[2])
+
+
+def scanned_host_identities(ip: str, port: int) -> list[tuple[str, bytes, str]]:
+    """Collect only explicit, unique supported SSH identities; no TOFU."""
+    response = run(["ssh-keyscan", "-4", "-T", "7", "-t", "ed25519,ecdsa,rsa",
+                    "-p", str(port), ip], timeout=25, check=False)
+    rows = [row.strip() for row in response.stdout.splitlines()
+            if row.strip() and not row.lstrip().startswith("#")]
+    if not rows:
+        fail("No supported SSH host key received. Check SSH port, listener, firewall and "
+             f"ED25519/ECDSA/RSA-SHA2 policy. ssh-keyscan: {response.stderr.strip()[-300:]}")
+    keys: dict[str, tuple[str, bytes, str]] = {}
+    for row in rows:
+        try:
+            record = (row + "\n").encode("ascii")
+            parts = row.split()
+            if len(parts) != 3:
+                fail("Unexpected extra fields in SSH host-key scan; nothing trusted.")
+            key_type = parts[1]
+            if key_type in keys:
+                fail("Duplicate SSH host key type in scan; refusing ambiguous response.")
+            fp = pinned_host_identity({"remote_ip": ip, "ssh_port": port}, record)
+            with tempfile.TemporaryDirectory(prefix="sc-hostscan-") as folder:
+                path = Path(folder) / "host"
+                path.write_bytes(record)
+                check = run(["ssh-keygen", "-lf", str(path)], timeout=10).stdout.split()
+            if len(check) < 2 or check[1] != fp:
+                fail("Observed SSH host fingerprint does not match the scanned host key or failed ssh-keygen validation.")
+            if key_type == "ssh-rsa" and (not check[0].isdigit() or int(check[0]) < 2048):
+                fail("RSA host key shorter than 2048 bits is not accepted.")
+            keys[key_type] = key_type, record, fp
+        except UnicodeEncodeError:
+            fail("SSH host-key scan contained non-ASCII data.")
+    return [keys[key] for key in HOST_KEY_ORDER if key in keys]
 
 def read_pinned_host_record() -> bytes:
     """Fail closed on mutable aliases, excessive content, or unsafe ownership."""
@@ -1012,7 +1089,8 @@ def enroll_public_key(intent: EnrollmentIntent | None = None) -> None:
 
     say(f"Public key destination: {intent.ssh_user}@{intent.remote_ip}:{intent.ssh_port}", "INFO")
     say(f"SSH private identity: {intent.identity_file}", "INFO")
-    say(f"Independently pinned remote ED25519: {intent.host_fingerprint}", "INFO")
+    host_type = pinned_host_type(intent.host_record)
+    say(f"Independently pinned remote {host_type}: {intent.host_fingerprint}", "INFO")
     say("Only the corresponding PUBLIC key will be installed; no network interception.", "WARN")
     if not yes_no(f"Authorize public-key enrollment on {intent.ssh_user}@{intent.remote_ip}:{intent.ssh_port}?"):
         say("Public-key enrollment cancelled. No remote action taken.", "INFO")
@@ -1064,7 +1142,7 @@ def enroll_public_key(intent: EnrollmentIntent | None = None) -> None:
             "-o", "GlobalKnownHostsFile=/dev/null",
             "-o", "UpdateHostKeys=no",
             "-o", "StrictHostKeyChecking=yes",
-            "-o", "HostKeyAlgorithms=ssh-ed25519",
+            "-o", f"HostKeyAlgorithms={host_key_signature_algorithms(host_type)}",
             "-o", "IdentitiesOnly=yes",
             "-o", "ConnectTimeout=10",
             f"{intent.ssh_user}@{intent.remote_ip}",
@@ -1136,35 +1214,24 @@ def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
         "remote_ip": remote_ip, "ssh_user": ssh_user, "ssh_port": ssh_port,
         "identity_file": identity_file,
     })
-    response = run(["ssh-keyscan", "-4", "-T", "7", "-t", "ed25519",
-                    "-p", str(cfg["ssh_port"]), cfg["remote_ip"]], timeout=15)
-    keys = [line for line in response.stdout.splitlines()
-            if line and not line.startswith("#") and len(line.split()) == 3
-            and line.split()[1] == "ssh-ed25519"]
-    if len(keys) != 1:
-        fail("Expected exactly one ED25519 host key. Verify SSH port and remote sshd configuration.")
-    with tempfile.TemporaryDirectory() as d:
-        keyfile = Path(d) / "key"
-        keyfile.write_text(keys[0] + "\n")
-        observed = run(["ssh-keygen", "-lf", str(keyfile)]).stdout.split()
-    if len(observed) < 2:
-        fail("Could not read SSH host fingerprint.")
-    actual = observed[1]
-    verified_host_record = (keys[0] + "\n").encode("ascii")
-    if pinned_host_identity(cfg, verified_host_record) != actual:
-        fail("Observed ED25519 fingerprint does not match the scanned host key; nothing saved.")
-    say(f"Observed remote ED25519: {actual} (not yet trusted).", "WARN")
-    print("  Obtain the trusted fingerprint from the REMOTE server console:")
-    print("  ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub")
+    candidates = scanned_host_identities(cfg["remote_ip"], cfg["ssh_port"])
+    for key_type, _, fp in candidates:
+        say(f"Observed remote {key_type}: {fp} (UNTRUSTED until confirmed).", "WARN")
+    print("  Obtain the chosen SSH host-key fingerprint independently from the SERVER console.")
+    print("  SERVER menu -> Show SERVER SSH host fingerprints (or ssh-keygen -lf <hostkey.pub>).")
     while True:
-        expected = ask(fingerprint, "Trusted remote ED25519 fingerprint (SHA256:...)")
-        if re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", expected) and expected == actual:
+        expected = ask(fingerprint, "Trusted remote HOST fingerprint (SHA256:...)")
+        chosen = [(key_type, record, fp) for key_type, record, fp in candidates
+                  if re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", expected) and expected == fp]
+        if len(chosen) == 1:
+            host_type, verified_host_record, actual = chosen[0]
             break
         if fingerprint is not None or not sys.stdin.isatty():
-            fail(f"Fingerprint mismatch. Observed {actual}; nothing saved.")
-        say("Fingerprint does not match. No SSH configuration was saved.", "ERROR")
+            fail("Fingerprint mismatch or unsupported host identity; nothing saved.")
+        say("Fingerprint does not match any supported observed host key. Nothing saved.", "ERROR")
         if not yes_no("Retry fingerprint entry?", default=True):
             fail("SSH fingerprint not approved; configuration cancelled.")
+    signatures = host_key_signature_algorithms(host_type)
     host = cfg["remote_ip"]
     port = cfg["ssh_port"]
     sshcfg = (
@@ -1172,6 +1239,8 @@ def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
         f"  HostName {host}\n  User {cfg['ssh_user']}\n  Port {port}\n"
         f"  IdentityFile {cfg['identity_file']}\n"
         f"  UserKnownHostsFile {KNOWN_HOSTS}\n"
+        f"  HostKeyAlgorithms {signatures}\n"
+        "  GlobalKnownHostsFile /dev/null\n  UpdateHostKeys no\n"
         "  StrictHostKeyChecking yes\n  IdentitiesOnly yes\n"
         "  BatchMode yes\n  AddressFamily inet\n"
         "  ConnectTimeout 10\n  ConnectionAttempts 1\n"
@@ -1199,7 +1268,7 @@ def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
             host_record=verified_host_record, host_fingerprint=actual,
             config_revision=ssh_configuration_snapshot(),
         )
-    say("Remote identity pinned and configuration saved. Network remains DIRECT/OFF.", "OK")
+    say(f"Remote {host_type} host key pinned ({actual}); network remains DIRECT/OFF.", "OK")
     if interactive:
         enroll_public_key(enrollment_intent)
         if yes_no("Test the remote SSH login and Python prerequisites now?", default=True):
@@ -1819,8 +1888,217 @@ def service_run() -> None:
     os.execvpe(argv[0], argv, os.environ)
 
 
+
+def server_host_report(*, probe: bool = False) -> dict:
+    """Read-only evidence: effective sshd config, local files and optional loopback scan.
+
+    Local public-key files and sshd -T are NOT proof of a listening SSH
+    daemon. A loopback scan may miss a listener bound only to an external IP.
+    """
+    report = {"active": False, "ports": [], "keys": [],
+              "notes": [], "observed": [], "configured": False}
+    try:
+        report["active"] = is_active("ssh.service") or is_active("sshd.service")
+    except (ConnectError, OSError, subprocess.TimeoutExpired) as exc:
+        report["notes"].append(f"SSH service state unknown: {exc}")
+    daemon = None
+    try:
+        daemon_stat = os.lstat(SSH_DAEMON)
+        if (stat.S_ISREG(daemon_stat.st_mode) and daemon_stat.st_uid == 0
+                and not daemon_stat.st_mode & 0o022):
+            daemon = str(SSH_DAEMON)
+        else:
+            report["notes"].append(f"Unsafe sshd executable identity or permissions: {SSH_DAEMON}")
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        report["notes"].append(f"Could not inspect sshd executable: {exc}")
+    config = {}
+    if daemon:
+        try:
+            detail = run([daemon, "-T"], check=False, timeout=8)
+            if detail.returncode:
+                report["notes"].append(f"sshd -T failed: {detail.stderr.strip()[-240:]}")
+            else:
+                for row in detail.stdout.splitlines():
+                    name, _, value = row.partition(" ")
+                    if value:
+                        config.setdefault(name, []).append(value.strip())
+                report["configured"] = True
+        except (ConnectError, OSError) as exc:
+            report["notes"].append(f"Unable to inspect effective sshd settings: {exc}")
+    else:
+        report["notes"].append("Trusted /usr/sbin/sshd unavailable: effective SSH configuration cannot be inspected.")
+
+    ports = []
+    for item in config.get("port", []):
+        if item.isdecimal() and 1 <= int(item) <= 65535:
+            ports.append(int(item))
+    report["ports"] = list(dict.fromkeys(ports))
+    accepted = set(",".join(config.get("hostkeyalgorithms", [])).split(","))
+    configured_paths = config.get("hostkey", [])
+    standard_paths = [str(SSH_HOST_DIR / f"ssh_host_{k}_key")
+                      for k in ("ed25519", "ecdsa", "rsa", "dsa")]
+    # Show configured missing keys AND extra local host keys not configured
+    # in sshd, including obsolete DSA. Never present extra files as enabled.
+    paths = list(dict.fromkeys(
+        configured_paths + [item for item in standard_paths
+                            if not report["configured"] or Path(item + ".pub").exists()
+                            or Path(item + ".pub").is_symlink()]
+    ))
+    for item in paths:
+        path = Path(item + ".pub")
+        entry = {"path": str(path), "type": "UNKNOWN", "fingerprint": "",
+                 "status": "PUBLIC KEY MISSING", "private": "NOT VERIFIED",
+                 "enabled": False}
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                st = os.fstat(fd)
+                if (not stat.S_ISREG(st.st_mode) or st.st_size > 8192
+                        or st.st_uid not in (0, os.geteuid()) or st.st_mode & 0o022):
+                    fail(f"Unsafe host public key file: {path}")
+                data = os.read(fd, 8193)
+            finally:
+                os.close(fd)
+            try:
+                public = data.decode("ascii").strip().split()
+            except UnicodeDecodeError:
+                fail("Host public key is not ASCII.")
+            if not public:
+                fail("Host public key file is empty.")
+            kind = public[0]
+            entry["type"] = kind
+            if kind not in HOST_KEY_ALGORITHMS:
+                entry["status"] = "UNSUPPORTED (DSA/other)"
+            else:
+                _, blob = single_public_record(data)
+                entry["fingerprint"] = host_key_fingerprint(kind, blob)
+                with tempfile.TemporaryDirectory(prefix="sc-hostkey-") as folder:
+                    snapshot = Path(folder) / "host.pub"
+                    snapshot.write_bytes(data)
+                    detail = run(["ssh-keygen", "-lf", str(snapshot)], timeout=10).stdout.split()
+                if len(detail) < 2 or detail[1] != entry["fingerprint"]:
+                    fail("Local host public key failed ssh-keygen validation.")
+                if kind == "ssh-rsa" and (not detail[0].isdigit() or int(detail[0]) < 2048):
+                    fail("Weak RSA host key (under 2048 bits).")
+                # A .pub file alone is not evidence sshd can use its matching
+                # private host key. Verify regular owner-only private material,
+                # then compare only derived PUBLIC halves, never print secrets.
+                private = Path(item)
+                try:
+                    private_stat = os.lstat(private)
+                except FileNotFoundError:
+                    entry["private"] = "MISSING"
+                except OSError as exc:
+                    entry["private"] = f"UNREADABLE ({exc})"
+                else:
+                    if (not stat.S_ISREG(private_stat.st_mode)
+                            or private_stat.st_uid not in (0, os.geteuid())
+                            or private_stat.st_mode & 0o077):
+                        entry["private"] = "UNSAFE TYPE, OWNER OR PERMISSIONS"
+                    else:
+                        try:
+                            derived = run(["ssh-keygen", "-y", "-P", "",
+                                           "-f", str(private)], timeout=12)
+                            derived_type, derived_blob = single_public_record(
+                                derived.stdout.encode("utf-8"))
+                            entry["private"] = ("PAIR MATCH" if (derived_type, derived_blob) == (kind, blob)
+                                                else "PUBLIC/PRIVATE KEY MISMATCH")
+                        except (ConnectError, OSError) as exc:
+                            entry["private"] = f"PAIR UNVERIFIED ({exc})"
+                allowed = host_key_signature_algorithms(kind).split(",")
+                entry["enabled"] = (entry["private"] == "PAIR MATCH"
+                                    and report["configured"]
+                                    and bool(accepted.intersection(allowed)))
+                if entry["private"] != "PAIR MATCH":
+                    entry["status"] = f"HOST KEY NOT READY: private {entry['private']}"
+                elif not report["configured"]:
+                    entry["status"] = "FILE PRESENT; effective config unknown"
+                elif item not in configured_paths:
+                    entry["enabled"] = False
+                    entry["status"] = "FILE PRESENT; NOT configured by sshd"
+                elif entry["enabled"]:
+                    entry["status"] = "FILE PRESENT; matched pair, configured/algorithm enabled; listener UNVERIFIED"
+                else:
+                    entry["status"] = "FILE PRESENT; host-key algorithm disabled"
+        except FileNotFoundError:
+            pass
+        except (ConnectError, OSError) as exc:
+            entry["status"] = f"INVALID/UNREADABLE: {exc}"
+        report["keys"].append(entry)
+
+    if not report["active"]:
+        report["notes"].append("SSH systemd service not confirmed active; inspect socket activation/listeners.")
+    if not report["ports"]:
+        report["notes"].append("No verified effective SSH port; do not assume 22.")
+    if not any(item["enabled"] for item in report["keys"]):
+        report["notes"].append("No verified configured supported host identity; check sshd config and keys.")
+    if probe and report["ports"]:
+        # This is an unprivileged read-only observation; it never generates a
+        # key, changes sshd, or connects to any non-local address.
+        local = {entry["type"]: entry for entry in report["keys"]
+                 if entry["enabled"] and entry["fingerprint"]}
+        for port in report["ports"][:4]:
+            try:
+                result = run(["ssh-keyscan", "-4", "-T", "3",
+                              "-t", "ed25519,ecdsa,rsa", "-p", str(port),
+                              "127.0.0.1"], check=False, timeout=12)
+                seen = []
+                for row in result.stdout.splitlines():
+                    fields = row.split()
+                    if not row or row.startswith("#") or len(fields) != 3:
+                        continue
+                    kind = fields[1]
+                    if kind in local and host_key_fingerprint(kind, fields[2]) == local[kind]["fingerprint"]:
+                        local[kind]["status"] = "OBSERVED on localhost; signature negotiation not yet tested"
+                        seen.append(kind)
+                if seen:
+                    report["observed"].append({"port": port, "types": seen})
+                else:
+                    report["notes"].append(f"No matching key observed on localhost:{port}; external-only listeners may differ.")
+            except (ConnectError, OSError) as exc:
+                report["notes"].append(f"Local SSH probe on port {port} failed: {exc}")
+        report["notes"].append("RSA host-key scans do not prove RSA-SHA2 negotiation; test with strict SSH client.")
+    return report
+
+
+def show_server_host_fingerprints(*, probe: bool = True) -> None:
+    require_root()
+    if (ETC / "role").is_symlink() or not (ETC / "role").is_file() or (
+            ETC / "role").read_text().strip() != "server":
+        fail("SERVER fingerprint action requires SERVER role; no client key is shown.")
+    info = server_host_report(probe=probe)
+    print("SERVER SSH host identities (PUBLIC keys only; never changes sshd):")
+    print(f"  SSH service: {'ACTIVE' if info['active'] else 'NOT VERIFIED ACTIVE'}")
+    print(f"  Effective SSH port(s): {', '.join(map(str, info['ports'])) or 'UNKNOWN'}")
+    for key in info["keys"]:
+        print(f"  {key['type']}: {key['fingerprint'] or '(no valid supported fingerprint)'}")
+        print(f"    {key['path']} — {key['status']}")
+    for note in info["notes"]:
+        say(note, "WARN")
+    if not probe:
+        say("Local files/config are not proof of a listening sshd; use SERVER fingerprint action for loopback observation.", "WARN")
+    say("Confirm the selected SHA256 fingerprint from this trusted console; the CLIENT must independently match it.", "INFO")
+
+
+
 def status() -> None:
-    state = read_json(STATE, {"status": "DIRECT"})
+    role = ETC / "role"
+    if role.is_symlink():
+        fail("Unsafe role path (symlink); status cannot be trusted.")
+    if not role.is_file():
+        print(f"Simple Connect: {VERSION}")
+        print("Role: NOT INSTALLED")
+        print("State: NOT INSTALLED (no Simple Connect network state verified)")
+        return
+    if role.read_text().strip() == "server":
+        print(f"Simple Connect: {VERSION} | SERVER (no proxy/tunnel)")
+        show_server_host_fingerprints(probe=False)
+        return
+    if role.read_text().strip() != "client":
+        fail("Unknown Simple Connect role; inspect role file, no network state inferred.")
+    state = read_json(STATE, {"status": "UNKNOWN"})
     print(f"Simple Connect: {VERSION}")
     role = (ETC / "role").read_text().strip().upper() if (ETC / "role").is_file() else "NOT SET UP"
     print(f"Role: {role}")
@@ -2142,7 +2420,12 @@ def menu_snapshot() -> dict[str, str]:
     if result["role"] == "SERVER":
         result["state"] = "SSH SERVER (no tunnel)"
         result["remote"] = "n/a (SSH endpoint)"
-        result["key"] = "n/a (managed by SSH server)"
+        info = server_host_report(probe=False)
+        eligible = [item for item in info["keys"] if item["enabled"]]
+        result["key"] = (f"{', '.join(item['type'] for item in eligible)} (key pairs checked; listener unverified)"
+                         if eligible else "NO VERIFIED SUPPORTED HOST KEY")
+        if not eligible or not info["active"]:
+            result["note"] = "SSH host key or service readiness unverified; see SERVER fingerprints."
         try:
             result["service"] = "RUNNING" if is_active("ssh.service") or is_active("sshd.service") else "NOT ACTIVE"
         except (OSError, subprocess.TimeoutExpired):
@@ -2226,30 +2509,45 @@ def menu_snapshot() -> dict[str, str]:
 
 
 def menu_header(section: str = "MAIN MENU") -> None:
-    width = max(38, min(88, shutil.get_terminal_size(fallback=(80, 24)).columns - 1))
+    width = max(24, min(88, shutil.get_terminal_size(fallback=(80, 24)).columns - 1))
     line = "-" * width
     info = menu_snapshot()
     state = info["state"]
-    state_tone = ("good" if state in ("DIRECT", "ACTIVE", "SSH SERVER (no tunnel)") and not info["note"]
-                  else "warn" if state in ("PENDING", "NOT INSTALLED") and not info["note"]
+    state_tone = ("good" if state in ("DIRECT", "ACTIVE") and not info["note"]
+                  else "warn" if state in ("PENDING", "NOT INSTALLED", "SSH SERVER (no tunnel)") and not info["note"]
                   else "error")
     print(paint("=" * width, "title"))
-    print(f"  {paint('SIMPLE CONNECT', 'title')}  v{VERSION}   |   {paint(section, 'heading')}")
+    print(f"  {paint('SIMPLE CONNECT', 'title')} v{VERSION}")
+    print(f"  {paint(section, 'heading')}")
     print(paint(line, "muted"))
-    print(f"  Role: {paint(info['role'], 'heading')}     Local IPv4: {info['local']}")
-    print(f"  Link: {paint(state, state_tone)}    Service: {info['service']}    Guard: {info['guard']}")
-    has_remote = info["role"] == "CLIENT" and info["remote"] not in ("NOT CONFIGURED", "INVALID CONFIG")
-    key_ready = info["key"].startswith("PRESENT: ")
-    configured = "READY (login untested)" if has_remote and key_ready else "INCOMPLETE" if has_remote else "NO"
-    print(f"  SSH configured: {paint(configured, 'good' if has_remote and key_ready else 'warn')}")
-    print(f"  Remote SSH: {info['remote']}")
-    key_tone = ("good" if info["key"].startswith("PRESENT: ") else
-                "warn" if info["key"] in ("NOT CONFIGURED", "n/a (managed by SSH server)") else
-                "error")
-    print(f"  Identity: {paint(info['key'], key_tone)}")
+
+    def item(label: str, value: str, tone: str = "heading") -> None:
+        content = f"{label}: {value}"
+        lines = textwrap.wrap(content, width=max(12, width - 4),
+                              break_long_words=True, break_on_hyphens=False)
+        for index, row in enumerate(lines):
+            print("  " + (paint(row, tone) if index == 0 and label == "Link" else row))
+
+    item("Role", info["role"])
+    item("Local IPv4", info["local"])
+    item("Link", state, state_tone)
+    item("Service", info["service"])
+    item("Guard", info["guard"])
+    if info["role"] == "SERVER":
+        item("Server host keys", info["key"])
+        item("SSH readiness", "UNVERIFIED until listener and authenticated SSH test")
+    else:
+        has_remote = info["role"] == "CLIENT" and info["remote"] not in ("NOT CONFIGURED", "INVALID CONFIG")
+        key_ready = info["key"].startswith("PRESENT: ")
+        configured = "KEY PRESENT (SSH untested)" if has_remote and key_ready else (
+            "INCOMPLETE" if has_remote else "NO")
+        item("SSH configured", configured)
+        item("Remote SSH", info["remote"])
+        item("Client identity", info["key"])
     if info["note"]:
-        print(f"  {paint('ATTENTION:', 'error')} {info['note'][:max(18, width - 16)]}")
+        item("ATTENTION", info["note"])
     print(paint(line, "muted"))
+
 
 
 def pause_menu() -> None:
@@ -2263,10 +2561,10 @@ def ssh_access_menu() -> None:
     while True:
         clear_menu()
         menu_header("SSH ACCESS")
-        print("  1) Install selected PUBLIC key on remote account (SSH password may be needed)")
-        print("  2) Show PUBLIC key for provider-console enrollment")
-        print("  3) Test authenticated remote SSH / Python")
-        print("  4) Configure remote endpoint / create or choose key")
+        print("  1) Enroll selected PUBLIC key")
+        print("  2) Show PUBLIC key")
+        print("  3) Test authenticated SSH / Python")
+        print("  4) Configure SSH / choose key")
         print("  0) Back to main menu\n")
         try:
             choice = input(f"{paint('Choose', 'heading')}: ").strip()
@@ -2297,14 +2595,23 @@ def menu() -> None:
         clear_menu()
         menu_header()
         print(f"  {paint('SETUP', 'heading')}")
-        print("   1) Setup remote SERVER       2) Setup Iran CLIENT")
-        print("   3) Configure SSH connection 11) SSH keys / access")
+        print("   1) Setup remote SERVER")
+        print("   2) Setup Iran CLIENT")
+        print("   3) Configure SSH connection")
+        print(f"  {paint('SSH ACCESS', 'heading')}")
+        print("  11) SSH keys / access")
         print(f"  {paint('CONNECTION', 'heading')}")
-        print(f"   4) {paint('Turn ON', 'warn')} (requires field approval)  5) Confirm ON (fresh SSH)")
+        print(f"   4) {paint('Turn ON', 'warn')} (field approval)")
+        print("   5) Confirm ON (fresh SSH)")
         print(f"   6) {paint('Turn OFF', 'good')}")
         print(f"  {paint('DIAGNOSTICS', 'heading')}")
-        print("   7) Status                    8) Test SSH + HTTPS")
-        print(f"   9) Logs                     10) {paint('Uninstall', 'error')} (destructive)")
+        print("   7) Status")
+        print("   8) Test SSH + HTTPS")
+        print("   9) Logs")
+        print(f"  {paint('SERVER INFORMATION', 'heading')}")
+        print("  12) Show SERVER SSH fingerprints")
+        print(f"  {paint('MAINTENANCE', 'heading')}")
+        print(f"  10) {paint('Uninstall', 'error')} (destructive)")
         print("   0) Exit\n")
         try:
             choice = input(f"{paint('Choose', 'heading')}: ").strip()
@@ -2337,6 +2644,8 @@ def menu() -> None:
             elif choice == "11":
                 ssh_access_menu()
                 continue
+            elif choice == "12":
+                show_server_host_fingerprints()
             else:
                 say("Invalid option. Choose one of the numbered menu entries.", "WARN")
         except (ConnectError, OSError, subprocess.TimeoutExpired, ValueError) as exc:
@@ -2360,8 +2669,8 @@ def main() -> int:
     c.add_argument("--ssh-user")
     c.add_argument("--ssh-port", type=int)
     c.add_argument("--identity-file")
-    c.add_argument("--fingerprint", help="ED25519 SHA256 host key fingerprint verified out of band")
-    for action in ("on", "off", "status", "logs", "guard", "recover", "internal-run"):
+    c.add_argument("--fingerprint", help="SHA256 of independently verified ED25519/ECDSA/RSA host key")
+    for action in ("on", "off", "status", "logs", "guard", "recover", "internal-run", "host-fingerprints"):
         sub.add_parser(action)
     cf = sub.add_parser("confirm")
     cf.add_argument("operation_id")
@@ -2388,6 +2697,8 @@ def main() -> int:
             confirm(args.operation_id)
         elif args.action == "status":
             status()
+        elif args.action == "host-fingerprints":
+            show_server_host_fingerprints()
         elif args.action == "test":
             test_path(args.url)
         elif args.action == "logs":
