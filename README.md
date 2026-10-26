@@ -5,7 +5,7 @@ A small, standalone SSH-based outbound connectivity manager for Linux hosting se
 - **SERVER (remote SSH endpoint):** check or install missing Python/SSH prerequisites and display the SSH ED25519 host fingerprint. It does not create a public proxy, user or credentials.
 - **CLIENT (Iran-side host):** install the verified official sshuttle **2.0.0** wheel without changing system Python packages; configure pinned SSH identity; manage transparent outbound IPv4 TCP and conventional UDP/53 DNS.
 
-**Status: [v0.1.0 GitHub pre-release](https://github.com/AChWorks/simple-connect/releases/tag/v0.1.0) — reviewed source and distribution, NOT production-field-accepted. The default HTTPS mirror has not been deployed. Do NOT run ON on a live hosting/production server without separately authorized host-specific field acceptance.**
+**Status: [v0.1.0 GitHub pre-release](https://github.com/AChWorks/simple-connect/releases/tag/v0.1.0) is the latest publicly published package; SSH onboarding/menu improvements for v0.1.1 are a separate unreleased source candidate. Neither release nor source candidate is production-field-accepted. The default HTTPS mirror has not been deployed. Do NOT run ON on a live hosting/production server without separately authorized host-specific field acceptance.**
 
 Simple Connect is intentionally separate from [Server Connect](https://github.com/AChWorks/server-connect). It does not use sing-box, alter the default route, provide general UDP/QUIC, or open foreign inbound access to websites.
 
@@ -87,9 +87,9 @@ The mirror hostname is owner-selected; its web-root storage and actual file depl
 
 ## Configure and use
 
-A pre-existing SSH account, working private key and a verified remote ED25519 fingerprint are necessary. Simple Connect does not create SSH users or keys. The remote IPv4 endpoint is selected later by the operator.
+An existing SSH account on the remote server and an independently verified remote ED25519 host fingerprint are required. **The interactive CLIENT menu now manages SSH key onboarding:** choose an existing secure key, or explicitly generate a dedicated passphrase-free ED25519 key pair on the CLIENT, then optionally enroll **only the public key** on the selected remote SSH account using its existing login credentials. This operation never creates remote users, changes their SSH server policy, copies a private key, or enables interception. If password enrollment is unavailable, the menu displays the verified public key for adding via a trusted remote console. The remote IPv4 address, SSH account and port are always operator-selected; verify the host fingerprint out-of-band before saving configuration. Generated private keys remain on the CLIENT even if Simple Connect is uninstalled, so key rotation/deletion is a separate operator decision.
 
-In the SERVER role the installer displays a host-key fingerprint. Verify it via a trusted console, not via an unverified network message. On the CLIENT:
+In SERVER role the installer displays its host-key fingerprint. Verify it via a trusted console, not via an unverified network message. In the unreleased v0.1.1 source candidate, an interactive installation opens the persistent, screen-clearing manager menu after setup; the published v0.1.0 asset still uses the earlier onboarding flow. **A failed configuration, bad field, SSH error, missing key or cancelled step returns to a guided menu** rather than exiting into a shell; headless installation still needs explicit flags. The menu header shows role, local IPv4, genuine proxy state, systemd guard/service state, remote SSH target and key readiness. ON remains OFF until explicitly requested and separately accepted on real hosts. From the CLIENT shell you may also use:
 
 ~~~bash
 sudo simple-connect                    # guided menu

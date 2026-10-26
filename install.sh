@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 readonly OFFICIAL_MANAGER="https://raw.githubusercontent.com/AChWorks/simple-connect/main/simple_connect.py"
 readonly OFFICIAL_WHEEL="https://files.pythonhosted.org/packages/25/1d/c409e26b9d5d26e6f07466c3d4662abb1c3ca4810424f66f38e1b5e54f33/sshuttle-2.0.0-py3-none-any.whl"
-readonly MANAGER_SHA256="b78ee7994e3c6bda599d025208a4fd723094496ae0ddbcfbc5f2053223a12110"
+readonly MANAGER_SHA256="ee180d45a495cdb3f58f4159615d402161e906645dc60881ba88302abf3ea2dc"
 readonly WHEEL_SHA256="506a8cad2f047ca42f0d784654cb3459e2193bfad79d0a03734e0e07473f2bbb"
 readonly DEFAULT_MIRROR="https://helpe.ir/simple-connect"
 
@@ -53,13 +53,16 @@ fi
 
 if [[ -z "$role" ]]; then
     [[ -e /dev/tty ]] || die "Specify --role server|client in noninteractive mode."
-    printf '\nSimple Connect - select this machine role:\n  1) SERVER (remote SSH endpoint)\n  2) CLIENT (Iran-side outbound connectivity)\n'
-    read -r -p 'Choose 1 or 2: ' choice < /dev/tty || die "Cannot read interactive choice."
-    case "$choice" in
-        1) role="server" ;;
-        2) role="client" ;;
-        *) die "Invalid role. Run installer again." ;;
-    esac
+    while [[ -z "$role" ]]; do
+        printf '\nSimple Connect - select this machine role:\n  1) SERVER (remote SSH endpoint)\n  2) CLIENT (Iran-side outbound connectivity)\n  0) Cancel\n'
+        read -r -p 'Choose 1 or 2: ' choice < /dev/tty || die "Cannot read terminal choice; installer cancelled."
+        case "$choice" in
+            1) role="server" ;;
+            2) role="client" ;;
+            0) info "Cancelled without installing."; exit 0 ;;
+            *) printf '[WARN] Choose 1, 2 or 0. No changes were made.\n' >&2 ;;
+        esac
+    done
 fi
 [[ "$role" == client || "$role" == server ]] || die "Role must be client or server."
 
@@ -79,8 +82,15 @@ info "Manager SHA-256 verified."
 if ( : </dev/tty ) 2>/dev/null; then
     exec 3< /dev/tty
     /usr/bin/python3 "$temp/simple_connect.py" setup "$role" --wheel-url "$wheel_url" <&3
+    # Keep the user in the manager after installation. Wizard errors are
+    # handled by its resilient menu rather than terminating the bootstrap.
+    /usr/bin/python3 "$temp/simple_connect.py" <&3
     exec 3<&-
 else
     /usr/bin/python3 "$temp/simple_connect.py" setup "$role" --wheel-url "$wheel_url" </dev/null
 fi
-printf '\n[OK] Installed. Manage with: sudo simple-connect\n'
+if [[ -x /usr/local/sbin/simple-connect ]]; then
+    printf '\n[OK] Simple Connect installed. Manage with: sudo simple-connect\n'
+else
+    info "Menu session finished; Simple Connect is no longer installed."
+fi
