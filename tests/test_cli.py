@@ -113,6 +113,33 @@ class CliOnboardingTests(unittest.TestCase):
                         sc.select_identity(str(Path(d) / "missing"))
                     generator.assert_not_called()
 
+    def test_server_fingerprint_pasted_as_client_path_is_rejected_and_recoverable(self):
+        with self.assertRaisesRegex(sc.ConnectError, "SERVER host fingerprint"):
+            sc.checked_key_name(FP)
+        with self.assertRaisesRegex(sc.ConnectError, "PUBLIC key text"):
+            sc.checked_key_name("ssh-ed25519 AAAA")
+        with tempfile.TemporaryDirectory() as d:
+            key = self.make_key(Path(d))
+            with (
+                patch.object(sc, "KEY_PATH", key),
+                patch.object(sc.sys, "stdin", TTY()),
+                patch("builtins.input", side_effect=[FP, str(key)]),
+                patch.object(sc, "create_dedicated_key") as generate,
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
+                selected = sc.select_identity(None)
+            self.assertEqual(selected, str(key))
+            generate.assert_not_called()
+            self.assertIn("step 5", out.getvalue())
+            self.assertIn("CLIENT file path", out.getvalue())
+            self.assertIn("SERVER fingerprint", out.getvalue())
+
+    def test_cli_private_path_fingerprint_mistake_fails_without_generation(self):
+        with patch.object(sc, "create_dedicated_key") as generate:
+            with self.assertRaisesRegex(sc.ConnectError, "SERVER host fingerprint"):
+                sc.select_identity(FP)
+            generate.assert_not_called()
+
     def test_invalid_field_retries_without_kicking_out_of_wizard(self):
         with patch.object(sc.sys, "stdin", TTY()), patch(
             "builtins.input", side_effect=["not-an-ip", "127.0.0.1", "8.8.8.8"]
@@ -526,6 +553,19 @@ class CliOnboardingTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO())) as result:
             self.assertEqual(sc.main(), 1)
         self.assertIn("requires a terminal", result.getvalue())
+
+
+    def test_narrow_key_path_prompt_wraps_and_keeps_back_navigation(self):
+        with patch.object(sc.shutil, "get_terminal_size",
+                          return_value=os.terminal_size((40, 24))), (
+             patch.object(sc.sys, "stdin", TTY())), (
+             patch("builtins.input", return_value="b")), (
+             contextlib.redirect_stdout(io.StringIO())) as output:
+            with self.assertRaisesRegex(sc.ConnectError, "Setup cancelled"):
+                sc.ask(None, "4/5 CLIENT private key FILE path",
+                       "/root/.ssh/simple_connect_ed25519")
+        self.assertIn("CLIENT private key FILE path", output.getvalue())
+        self.assertTrue(all(len(row) <= 39 for row in output.getvalue().splitlines()))
 
 
 if __name__ == "__main__":
