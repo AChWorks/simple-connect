@@ -5,15 +5,15 @@ A small, standalone SSH-based outbound connectivity manager for Linux hosting se
 - **SERVER (remote SSH endpoint):** check or install missing Python/SSH prerequisites and display available ED25519, ECDSA and RSA-SHA2 host-key fingerprints from the trusted console. Local key files, effective sshd configuration, and actual listener observations are distinguished; the tool never creates host keys or SSH accounts.
 - **CLIENT (Iran-side host):** install the verified official sshuttle **2.0.0** wheel without changing system Python packages; configure pinned SSH identity; manage transparent outbound IPv4 TCP and conventional UDP/53 DNS.
 
-**The main-branch successor (v0.1.2 candidate, pending independent review) adds a one-column menu, SERVER host-key diagnostics, and secure multi-algorithm host-key pinning. These changes are NOT in the published v0.1.1 package until a separately authorized new release.**
+**New in v0.1.2:** a strictly single-column interactive menu, discoverable SERVER SSH host fingerprints and readiness diagnostics, and secure ED25519/ECDSA/RSA-SHA2 host-key pinning with independent SHA256 confirmation. Existing guarded networking and OFF-by-default behavior remain unchanged.
 
-**Status: [v0.1.1 GitHub pre-release](https://github.com/AChWorks/simple-connect/releases/tag/v0.1.1) is the latest publicly published package, including self-service SSH key onboarding and the resilient full-screen CLI. This pre-release has not passed real Debian 13/aaPanel production field acceptance. The default HTTPS mirror has not been deployed. Do NOT run ON on a live hosting/production server without separately authorized host-specific field acceptance.**
+**Status: [v0.1.2 GitHub pre-release](https://github.com/AChWorks/simple-connect/releases/tag/v0.1.2) is the current verified package. Its Debian 13.7 isolated KVM/QEMU SERVER/CLIENT installation, root-menu, SSH, systemd, nftables, ON/OFF, reboot recovery and uninstall acceptance passed; first-time password-based key enrollment remains NOT_RUN. Physical Debian 13/aaPanel production field acceptance and the owner HTTPS mirror remain pending in [Issue #2](https://github.com/AChWorks/simple-connect/issues/2). Do NOT activate ON on a live hosting server without separately approved host-specific acceptance.**
 
 Simple Connect is intentionally separate from [Server Connect](https://github.com/AChWorks/server-connect). It does not use sing-box, alter the default route, provide general UDP/QUIC, or open foreign inbound access to websites.
 
 ## Distribution and installer (live-host acceptance still required)
 
-The [v0.1.1 GitHub pre-release](https://github.com/AChWorks/simple-connect/releases/tag/v0.1.1) publishes a verified four-file archive and detached ZIP checksum. These installer entry points exist, but no host-specific production activation has been accepted. The GitHub raw `main` installer is mutable; for an immutable distribution, use the tagged Release assets and verify their authenticity and checksum before use.
+The [v0.1.2 GitHub pre-release](https://github.com/AChWorks/simple-connect/releases/tag/v0.1.2) publishes a verified four-file archive and detached ZIP checksum. These installer entry points exist, but no host-specific production activation has been accepted. The GitHub raw `main` installer is mutable; for an immutable distribution, use the tagged Release assets and verify their authenticity and checksum before use.
 
 Primary GitHub installer (both roles, interactive role selection):
 
@@ -47,13 +47,13 @@ mirror one-liner is not functional.
 
 The bootstrap verifies the manager's embedded pinned SHA-256. The manager independently verifies the official upstream wheel SHA-256 even when downloaded from the mirror. A malicious replacement of the **bootstrap itself** could also replace its checksum: trust the mirror or verify the bootstrap checksum against an authenticated independent source *before running it as root*. The build script below emits SHA256SUMS for independent comparison. Do not treat HTTPS or a self-supplied checksum alone as publisher authentication.
 
-The [v0.1.1 GitHub pre-release](https://github.com/AChWorks/simple-connect/releases/tag/v0.1.1) provides the permanent `simple-connect-mirror.zip` archive and separate `simple-connect-mirror.zip.sha256` checksum. Verify the downloaded pair:
+The [v0.1.2 GitHub pre-release](https://github.com/AChWorks/simple-connect/releases/tag/v0.1.2) provides the permanent `simple-connect-mirror.zip` archive and separate `simple-connect-mirror.zip.sha256` checksum. Verify the downloaded pair:
 
 ~~~bash
 sha256sum -c simple-connect-mirror.zip.sha256
 ~~~
 
-The independently reviewed v0.1.1 ZIP SHA256 is `993a04a12d57f2d7590fd6f9b571493e8865b9b3d1eff0afedd524f83aa32896`; the [v0.1.1 tag](https://github.com/AChWorks/simple-connect/releases/tag/v0.1.1) identifies the published source. For historical comparison, the v0.1.0 ZIP SHA256 was `b0e6c276d13bdf7d8b3b63bb00560d2f744933c20d4859bb00435306c65a533c`. The archive contains the same **four flat files** used by any trusted, operator-hosted HTTPS mirror (`--mirror https://their.example/path`). An independently trusted source is still needed to authenticate the bootstrap: a checksum retrieved solely from the same untrusted server is not proof of publisher identity.
+The verified v0.1.2 ZIP SHA256 is `3b20f089ae1fa3f7f709a54fe38593e727ae2f6b385b9d6b16c4a523a4e0f1c5`; the [v0.1.2 tag](https://github.com/AChWorks/simple-connect/releases/tag/v0.1.2) identifies its immutable source. Historical checksums: v0.1.1 `993a04a12d57f2d7590fd6f9b571493e8865b9b3d1eff0afedd524f83aa32896` and v0.1.0 `b0e6c276d13bdf7d8b3b63bb00560d2f744933c20d4859bb00435306c65a533c`. The archive contains the same **four flat files** used by any trusted, operator-hosted HTTPS mirror (`--mirror https://their.example/path`). An independently trusted source is still needed to authenticate the bootstrap: a checksum retrieved solely from the same untrusted server is not proof of publisher identity.
 
 Prepare an independent mirror folder using:
 
@@ -127,7 +127,7 @@ OFF restores Direct routing (which may still have blocked international download
 - No automatic proxy reconnection loop, no generic whole-host killswitch, no default-route changes, no global firewall flush. By default failure recovers the original Direct state, not necessarily foreign connectivity.
 - Initial target: Debian 13 amd64 with systemd, nftables, iproute2, **Python >=3.10 and <4.0** on both local and SSH remote, and working remote SSH. Other systems have not been accepted.
 - Pinned official sshuttle 2.0.0 is installed in /opt/simple-connect/sshuttle. It is not installed into global pip. Repeated setup skips a correct, verified installation.
-- IMPORTANT: Author-operated isolated Debian 13 systemd/SSH guest tests exercised basic ON/OFF, new SSH confirmation, a simulated unconfirmed deadline, SIGKILL, guard shutdown, foreign-rule preservation, and nine interrupted-uninstall recovery checkpoints. Independent high-assurance reviewers approved the exact source and release-preparation candidates, but did **not** independently reproduce the guest or physical host tests. Neither CI nor isolated guest evidence establishes physical reboot behavior, live hosting SSH recovery, aaPanel/website response safety, mixed production firewall/conntrack acceptance, or all partial failure timings. Separately authorized, host-specific field acceptance is still required **before executing ON on real hosting**.
+- IMPORTANT: Owner-authorized independent Debian 13.7 KVM/QEMU SERVER and CLIENT guests executed real root installation, 40-column menu operations, actual SSH and HTTPS, fresh SSH confirmation, ON/PENDING/ACTIVE/OFF, nftables/service guard checks, service-stop/SIGKILL recovery, reboot **of the isolated CLIENT guest from ACTIVE**, and uninstall with SSH preserved. Ten complete root PTY suites totalled 63/63 PASS; 131 automated source tests passed. A separate initial interactive configuration **test harness** timed out at an unhandled enrollment consent prompt (6/7 checks passed), with the saved configuration and subsequent cancellation/SSH paths separately verified. First-time password-based key enrollment is **NOT_RUN**. An author-separated independent reviewer verified the preserved evidence and approved Issue #8; the reviewer did not independently rerun these privileged tests. **None** of this proves physical production reboot, aaPanel/website coexistence, external HTTPS mirror availability, mixed host firewall/conntrack behavior or Iran-to-remote connectivity. Host-specific field acceptance under [Issue #2](https://github.com/AChWorks/simple-connect/issues/2) is still required before ON on real hosting.
 
 ## Development checks
 
@@ -137,6 +137,6 @@ python3 -m py_compile simple_connect.py
 bash -n install.sh scripts/build-mirror-bundle.sh
 ~~~
 
-These are hermetic source-level tests, NOT proof of live SSH/website/aaPanel/IPv6/rollback safety. Do not execute root networking tests on shared Dev or production hosts. The contract separates Python standard-library control logic, sshuttle's upstream data plane, systemd units and a minimal Bash bootstrap; state/config have a versioned JSON schema for deliberate future migration without an unnecessary framework.
+These commands run the hermetic source-level checks; the separately recorded disposable-root QEMU acceptance above does not prove live hosting/aaPanel/IPv6 safety. Do not execute root networking tests on shared Dev or production hosts. The contract separates Python standard-library control logic, sshuttle's upstream data plane, systemd units and a minimal Bash bootstrap; state/config have a versioned JSON schema for deliberate future migration without an unnecessary framework.
 
 Upstream: [sshuttle](https://github.com/sshuttle/sshuttle) (2.0.0, LGPL-2.1).
