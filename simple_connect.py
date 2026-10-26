@@ -44,6 +44,7 @@ CONF = ETC / "config.json"
 SSH_CONF = ETC / "ssh_config"
 KNOWN_HOSTS = ETC / "known_hosts"
 STATE = STATE_DIR / "state.json"
+TEARDOWN = STATE_DIR / "uninstalling.json"
 LOCK = Path("/run/lock/simple-connect.lock")
 TABLE = "sshuttle-ipv4-13080"
 PORT = 13080
@@ -225,6 +226,49 @@ def require_client_role() -> None:
         fail("This action requires a configured CLIENT role; SERVER role is SSH-only.")
 
 
+
+def teardown_pending() -> bool:
+    return TEARDOWN.exists() or TEARDOWN.is_symlink()
+
+
+def require_no_teardown() -> None:
+    if teardown_pending():
+        fail("Client uninstall is pending; retry 'uninstall --yes' before configuring or activating.")
+
+
+def process_birth(pid: int) -> str | None:
+    """Kernel process start-time identity, not just a reusable PID."""
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_text()
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def reserve_uninstall() -> None:
+    """Durable lifecycle reservation; called with manager lock held."""
+    if teardown_pending():
+        old = read_json(TEARDOWN)
+        previous_pid = old.get("pid")
+        if (old.get("boot") == boot_id() and type(previous_pid) is int
+                and process_birth(previous_pid) is not None
+                and process_birth(previous_pid) == old.get("birth")):
+            fail("Another uninstall operation remains active; refusing overlap.")
+        say("Resuming interrupted client uninstall.", "WARN")
+    state = read_json(STATE, {"status": "DIRECT"})
+    if state.get("status") == "STOPPING" and not teardown_pending():
+        fail("OFF/recovery is already in progress. Retry uninstall after it completes.")
+    birth = process_birth(os.getpid())
+    if birth is None:
+        fail("Cannot prove current uninstall process identity.")
+    write_json(TEARDOWN, {
+        "status": "REMOVING", "boot": boot_id(),
+        "pid": os.getpid(), "birth": birth,
+        "started": int(time.time()),
+    })
+
+
+
 def install_requirements(role: str) -> None:
     if not Path("/etc/os-release").exists():
         fail("Only apt-based Linux hosts are supported at present.")
@@ -384,26 +428,70 @@ WantedBy=timers.target
     }
 
 
+
+def validate_existing_client_units() -> None:
+    """Refuse to overwrite unrelated systemd units during incomplete setup."""
+    for name in unit_texts():
+        path = UNIT_DIR / name
+        if path.is_symlink():
+            fail(f"Unexpected symlinked systemd unit: {path}")
+        if path.exists() and (not path.is_file() or
+                              not path.read_text().startswith("# Managed by Simple Connect;")):
+            fail(f"Refusing to replace non-owned systemd unit: {path}")
+
+
+def first_install_retry_is_safe() -> None:
+    """Proof for a never-activated, interrupted initial client setup."""
+    if CONF.exists() or CONF.is_symlink() or SSH_CONF.exists() or KNOWN_HOSTS.exists():
+        fail("Missing/incomplete CLIENT state with SSH configuration: manual recovery required.")
+    if not service_terminated() or any_proxy_tables():
+        fail("Incomplete CLIENT install with live proxy/firewall: refuse retry.")
+    validate_existing_client_units()
+
+
+
 def setup(role: str, wheel_url: str) -> None:
     require_root()
+    require_no_teardown()
     role_path = ETC / "role"
-    if role_path.exists():
+    previous = role_path.exists() or role_path.is_symlink()
+    state_exists = STATE.exists() or STATE.is_symlink()
+    initial_client = role == "client" and (not state_exists or
+                      read_json(STATE).get("status") == "INSTALLING")
+
+    if previous:
         if role_path.is_symlink() or not role_path.is_file():
             fail("Unsafe role file; refusing setup.")
         current_role = role_path.read_text().strip()
         if current_role != role:
             fail(f"Host already configured as {current_role}; switch roles only after cleanup.")
-        if current_role == "client":
-            if not STATE.is_file() or STATE.is_symlink():
-                fail("Existing CLIENT state is missing/unsafe. Recovery required before setup.")
-            old = read_json(STATE)
-            if old.get("status") != "DIRECT" or not service_terminated() or any_proxy_tables():
-                fail("Recovery unresolved, service may be running or nft table remains: refuse setup/update.")
+        if role == "client":
+            if STATE.is_symlink() or (state_exists and not STATE.is_file()):
+                fail("Unsafe CLIENT state file; refuse setup.")
+            if initial_client:
+                first_install_retry_is_safe()
+            else:
+                old = read_json(STATE)
+                if old.get("status") != "DIRECT" or not service_terminated() or any_proxy_tables():
+                    fail("Recovery unresolved, service may be running or nft table remains: refuse setup/update.")
+                validate_existing_client_units()
         elif CONF.exists() or STATE.exists() or is_active(SERVICE):
             fail("Unexpected CLIENT resources on SERVER role; use documented recovery before setup.")
-    elif STATE.exists() or CONF.exists() or is_active(SERVICE):
-        fail("Orphan CLIENT state/service exists; refuse to replace recovery assets.")
+    elif state_exists:
+        if role == "client" and not STATE.is_symlink() and STATE.is_file() and initial_client:
+            first_install_retry_is_safe()
+        else:
+            fail("Orphan CLIENT state/service exists; refuse to replace recovery assets.")
+    elif CONF.exists() or CONF.is_symlink() or is_active(SERVICE):
+        fail("Orphan CLIENT resources or service detected; refuse setup.")
+
     install_requirements(role)
+    # INSTALLING is a durable, never-activated marker. It is written before
+    # both the role and the wheel to make failed first installs retryable.
+    # Existing activated clients NEVER have their recovery state overwritten.
+    if initial_client:
+        STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        write_json(STATE, {"status": "INSTALLING", "boot": boot_id()})
     install_entrypoint()
     ETC.mkdir(mode=0o700, parents=True, exist_ok=True)
     atomic_write(role_path, (role + "\n").encode())
@@ -427,7 +515,7 @@ def setup(role: str, wheel_url: str) -> None:
             atomic_write(path, text.encode(), 0o644)
     unit_action("daemon-reload")
     unit_action("enable", "--now", GUARD_TIMER)
-    if not STATE.exists():
+    if initial_client:
         write_json(STATE, {"status": "DIRECT"})
     say("Client installed (Direct/OFF). Network interception is NOT enabled.", "OK")
     if not CONF.exists() and sys.stdin.isatty():
@@ -449,6 +537,7 @@ def ask(value: str | None, label: str, default: str | None = None) -> str:
 def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
               identity_file: str | None, fingerprint: str | None) -> None:
     require_root()
+    require_no_teardown()
     require_client_role()
     if not service_terminated() or read_json(STATE).get("status") != "DIRECT" or any_proxy_tables():
         fail("Switch OFF and complete recovery before changing the SSH endpoint.")
@@ -590,6 +679,94 @@ def initial_ssh_connection(*, proc_root: Path = Path('/proc'), pid: int | None =
         fail("SSH socket has invalid endpoint ports.")
     return f"{peer_ip} {peer_port} {host_ip} {host_port} {inode}"
 
+
+
+
+def ssh_connection_inventory(proc_root: Path = Path("/proc")) -> list[str]:
+    """Post-activation baseline of established SSH TCP sockets on this host.
+
+    Scan the kernel's established sockets and SSH daemon processes, not
+    SSH_CONNECTION or user-supplied session data. The baseline is taken
+    AFTER sshuttle is running, so a pre-existing second login cannot
+    confirm that new administration remains possible.
+    """
+    established: dict[int, str] = {}
+    for filename, is_v6 in (("tcp", False), ("tcp6", True)):
+        try:
+            lines = (proc_root / "net" / filename).read_text().splitlines()[1:]
+        except OSError as exc:
+            fail(f"Cannot inventory kernel TCP connections: {exc}")
+        for line in lines:
+            parsed = parse_proc_tcp_line(line, ipv6=is_v6)
+            if parsed:
+                established[parsed[4]] = " ".join(str(x) for x in parsed)
+    found: set[str] = set()
+    try:
+        processes = list(proc_root.iterdir())
+    except OSError as exc:
+        fail(f"Cannot inventory SSH processes: {exc}")
+    for proc in processes:
+        if not proc.name.isdigit():
+            continue
+        try:
+            exe = Path(os.readlink(proc / "exe")).name
+        except (OSError, PermissionError):
+            continue
+        if exe not in ("sshd", "sshd-session"):
+            continue
+        try:
+            fds = list((proc / "fd").iterdir())
+        except (OSError, PermissionError) as exc:
+            fail(f"Cannot inspect an SSH daemon's TCP sockets: {exc}")
+        for fd in fds:
+            try:
+                target = os.readlink(fd)
+            except (OSError, PermissionError):
+                continue
+            match = re.fullmatch(r"socket:\[(\d+)\]", target)
+            if match and int(match.group(1)) in established:
+                found.add(established[int(match.group(1))])
+    return sorted(found)
+
+
+def require_external_management_peer(peer_ip: str) -> None:
+    """Reject localhost/self-originated SSH confirmations.
+
+    Private remote peers are valid: don't restrict users to public SSH.
+    """
+    try:
+        peer = ipaddress.IPv4Address(peer_ip)
+    except ipaddress.AddressValueError:
+        fail("Non-IPv4 SSH management connection; cannot confirm remote access.")
+    if peer.is_loopback or peer.is_unspecified or peer.is_link_local or peer.is_multicast:
+        fail("Local-only SSH connection cannot confirm external management access.")
+    res = run(["ip", "-j", "-4", "address", "show"], timeout=10)
+    try:
+        interfaces = json.loads(res.stdout)
+        if not isinstance(interfaces, list):
+            raise ValueError()
+        local_ips = {
+            str(ipaddress.IPv4Address(info["local"]))
+            for iface in interfaces
+            for info in iface["addr_info"]
+            if info.get("family") == "inet"
+        }
+    except (ValueError, TypeError, KeyError, ipaddress.AddressValueError):
+        fail("Cannot identify local IPv4 addresses to verify SSH session origin.")
+    if str(peer) in local_ips:
+        fail("Self-originated SSH connection cannot confirm external management access.")
+
+
+def boot_seconds() -> float:
+    """Linux CLOCK_BOOTTIME: elapsed time incl. suspension; wall-clock independent."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def pending_expired(state: dict) -> bool:
+    deadline = state.get("deadline_boot")
+    if type(deadline) not in (int, float) or not (0 < deadline < float("inf")):
+        return True  # legacy/corrupt PENDING must never extend the safety window
+    return boot_seconds() >= deadline
 
 
 def boot_id() -> str:
@@ -836,6 +1013,7 @@ def start_proxy() -> None:
     require_root()
     require_client_role()
     with locked():
+        require_no_teardown()
         cfg = read_config()
         if not is_active(GUARD_TIMER):
             fail("Independent guard timer inactive. Run setup-client; do not bypass the guard.")
@@ -845,9 +1023,11 @@ def start_proxy() -> None:
         excludes = effective_exclusions(cfg["remote_ip"], ssh_conn.split()[0])
         op = secrets.token_hex(8)
         port = choose_port()
+        started = boot_seconds()
         state = {
             "status": "PENDING", "op": op, "boot": boot_id(),
             "started": int(time.time()), "deadline": int(time.time()) + 600,
+            "started_boot": started, "deadline_boot": started + 600,
             "original_ssh_connection": ssh_conn, "management_ip": ssh_conn.split()[0],
             "remote_ip": cfg["remote_ip"], "listen_port": port,
             "exclusions": excludes, "table_sha256": "",
@@ -856,11 +1036,13 @@ def start_proxy() -> None:
     # Never hold the manager lock during systemd's start/stop transactions.
     # ExecStopPost and the independent guard need that same lock to recover.
     try:
+        require_no_teardown()
         unit_action("start", SERVICE)
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline and current_table(state) is None and is_active(SERVICE):
             time.sleep(0.2)
         with locked():
+            require_no_teardown()
             observed = read_json(STATE)
             if observed.get("op") != op or observed.get("status") != "PENDING":
                 fail("Activation changed concurrently; refusing to commit firewall identity.")
@@ -869,6 +1051,13 @@ def start_proxy() -> None:
             table = current_table(observed)
             if table is None:
                 fail("No expected nftables table after sshuttle startup.")
+            # Snapshot *all* pre-existing established SSH connections only
+            # AFTER the proxy firewall is active. Confirmation must use a
+            # new authenticated TCP connection not in this durable baseline.
+            previous = ssh_connection_inventory()
+            if ssh_conn not in previous:
+                fail("Initiating SSH connection not found in server-side socket baseline.")
+            observed["ssh_preexisting"] = previous
             observed["table_sha256"] = table_hash(table)
             write_json(STATE, observed)
     except Exception:
@@ -884,14 +1073,17 @@ def confirm(op: str) -> None:
     require_root()
     require_client_role()
     with locked():
+        require_no_teardown()
         state = read_json(STATE)
         if state.get("status") != "PENDING" or not secrets.compare_digest(str(state.get("op", "")), op):
             fail("No matching pending activation operation.")
-        if state.get("boot") != boot_id() or int(time.time()) >= int(state.get("deadline", 0)):
+        if state.get("boot") != boot_id() or pending_expired(state):
             fail("Confirmation deadline expired or server rebooted. Recovery required.")
         fresh = initial_ssh_connection()
-        if fresh == state.get("original_ssh_connection"):
-            fail("Confirmation MUST come from a fresh independent SSH session.")
+        prior = state.get("ssh_preexisting")
+        if not isinstance(prior, list) or not prior or fresh in prior:
+            fail("Confirmation MUST use a new SSH TCP connection established AFTER activation.")
+        require_external_management_peer(fresh.split()[0])
         if not is_active(SERVICE):
             fail("Proxy process is not active.")
         table = current_table(state)
@@ -900,6 +1092,8 @@ def confirm(op: str) -> None:
         state["status"] = "ACTIVE"
         state["confirmed_at"] = int(time.time())
         state.pop("deadline", None)
+        state.pop("deadline_boot", None)
+        state.pop("ssh_preexisting", None)
         write_json(STATE, state)
     say("ACTIVE: authenticated fresh SSH session confirmed; ongoing guard remains armed.", "OK")
 
@@ -913,10 +1107,12 @@ def recover(reason: str = "service_exit_or_manual_recovery") -> None:
         reconcile(reason)
 
 
-def stop_proxy() -> None:
+def stop_proxy(*, for_uninstall: bool = False) -> None:
     require_root()
     require_client_role()
     with locked():
+        if not for_uninstall:
+            require_no_teardown()
         state = read_json(STATE, {"status": "DIRECT"})
         if state.get("status") in ("PENDING", "ACTIVE"):
             write_json(STATE, {**state, "status": "STOPPING"})
@@ -954,11 +1150,20 @@ def guarded_check() -> None:
         elif status == "UNCERTAIN":
             if service_terminated():
                 fail("Recovery UNCERTAIN: firewall requires manual verification.")
+        elif status == "INSTALLING":
+            # Retain the interrupted first-install transaction until setup
+            # finishes. A guard tick must not turn it into completed DIRECT.
+            if service_terminated() and not any_proxy_tables():
+                return
+            mark_uncertain("unexpected_proxy_during_install")
+            fail("Proxy resources discovered during initial install: UNCERTAIN.")
         else:
             stale_boot = state.get("boot") != boot_id()
-            expired = status == "PENDING" and int(time.time()) >= int(state.get("deadline", 0))
+            expired = status == "PENDING" and pending_expired(state)
             process_lost = status in ("ACTIVE", "PENDING") and not is_active(SERVICE)
-            startup_grace = status == "PENDING" and int(time.time()) - int(state.get("started", 0)) < 45
+            started_boot = state.get("started_boot")
+            startup_grace = (status == "PENDING" and type(started_boot) in (int, float)
+                             and 0 <= boot_seconds() - started_boot < 45)
             observed_table = current_table(state)
             changed = observed_table is not None and bool(state.get("table_sha256")) and not table_is_ours(
                 observed_table, str(state["table_sha256"])
@@ -974,6 +1179,7 @@ def guarded_check() -> None:
 def service_run() -> None:
     require_root()
     require_client_role()
+    require_no_teardown()
     cfg = read_config()
     if not is_active(GUARD_TIMER):
         fail("Guard not armed; refusing to start.")
@@ -1052,38 +1258,81 @@ def uninstall(yes: bool) -> None:
         fail("Uninstall destroys Simple Connect's private configuration. Use 'uninstall --yes'.")
     role_path = ETC / "role"
     if role_path.is_file() and role_path.read_text().strip() == "server":
-        # The remote role never installed nftables, a tunnel, or systemd
-        # service units. Do not require local nft tooling to uninstall.
-        if STATE.exists() or not service_terminated():
-            fail("Unexpected active CLIENT state on SERVER role; refusing ambiguous cleanup.")
-        for path in (CONF, SSH_CONF, KNOWN_HOSTS, APP, COMMAND, role_path):
-            if path.is_file() and not path.is_symlink():
-                path.unlink()
-        if ETC.is_dir() and not any(ETC.iterdir()):
-            ETC.rmdir()
+        # Server-only cleanup does not touch SSH accounts or host firewall.
+        with locked():
+            require_no_teardown()
+            if STATE.exists() or not service_terminated():
+                fail("Unexpected active CLIENT state on SERVER role; refusing ambiguous cleanup.")
+            for path in (CONF, SSH_CONF, KNOWN_HOSTS, APP, COMMAND, role_path):
+                if path.is_file() and not path.is_symlink():
+                    path.unlink()
+            if ETC.is_dir() and not any(ETC.iterdir()):
+                ETC.rmdir()
         say("Server-side Simple Connect manager removed; existing SSH remains unchanged.", "OK")
         return
-    stop_proxy()
-    if read_json(STATE, {"status": "DIRECT"}).get("status") != "DIRECT":
-        fail("Recovery uncertain; refusing to uninstall with active or unknown firewall resources.")
-    subprocess.run(["systemctl", "disable", "--now", GUARD_TIMER], timeout=20, check=False)
+
+    require_client_role()
+    with locked():
+        reserve_uninstall()
+
+    # The reservation, not the manager lock, excludes concurrent ON/SETUP,
+    # CONFIGURE, CONFIRM and ordinary OFF during systemd stop / teardown.
+    # ExecStopPost still needs to obtain the normal manager lock.
+    stop_proxy(for_uninstall=True)
+    with locked():
+        if (read_json(STATE, {"status": "UNKNOWN"}).get("status") != "DIRECT"
+                or not service_terminated() or any_proxy_tables()):
+            fail("Recovery incomplete; preserving manager and teardown reservation.")
+
+    # Never ignore failed disablement or delete unit code while systemd
+    # can still invoke it.
+    unit_action("disable", "--now", GUARD_TIMER)
+    if is_active(GUARD_TIMER):
+        fail("Independent guard timer remains active; refusing to remove manager.")
+    enabled = run(["systemctl", "is-enabled", GUARD_TIMER], check=False, timeout=10)
+    if enabled.returncode == 0 or enabled.stdout.strip() not in ("disabled", "not-found", "masked"):
+        fail("Could not verify guard timer is disabled; resources retained.")
+    if is_active(GUARD_UNIT):
+        unit_action("stop", GUARD_UNIT)
+    if is_active(GUARD_UNIT):
+        fail("Guard service remains active; resources retained.")
+
+    # Check the whole set before deleting any systemd file.
     for name, expected in unit_texts().items():
         path = UNIT_DIR / name
-        if path.is_file() and path.read_text().startswith("# Managed by Simple Connect;"):
-            path.unlink()
+        if path.is_symlink() or (path.exists() and
+             (not path.is_file() or path.read_text() != expected)):
+            fail(f"Unexpected modified systemd unit: {path}; retain for inspection.")
+
+    with locked():
+        if (not teardown_pending() or not service_terminated() or any_proxy_tables()
+                or read_json(STATE).get("status") != "DIRECT"):
+            fail("Uninstall safety prerequisites changed; keeping owned resources.")
+        for name in unit_texts():
+            path = UNIT_DIR / name
+            if path.is_file():
+                path.unlink()
     unit_action("daemon-reload")
-    for path in (CONF, SSH_CONF, KNOWN_HOSTS, STATE, ETC / "role"):
-        if path.is_file():
+
+    # Preserve role, manager and reservation until all systemd operations
+    # have succeeded. An interrupted teardown can be resumed with --yes.
+    for path in (CONF, SSH_CONF, KNOWN_HOSTS):
+        if path.is_file() and not path.is_symlink():
             path.unlink()
+    if PKG.exists() and PKG.joinpath(".wheel-sha256").is_file():
+        shutil.rmtree(PKG)
+    for path in (COMMAND, APP):
+        if path.is_file() and not path.is_symlink():
+            path.unlink()
+    for path in (STATE, role_path):
+        if path.is_file() and not path.is_symlink():
+            path.unlink()
+    TEARDOWN.unlink()
     for path in (ETC, STATE_DIR):
         if path.is_dir() and not any(path.iterdir()):
             path.rmdir()
-    if PKG.exists() and PKG.joinpath(".wheel-sha256").is_file():
-        shutil.rmtree(PKG)
-    for path in (APP, COMMAND):
-        if path.is_file():
-            path.unlink()
     say("Owned resources removed; no global firewall, route, SSH or credentials were changed.", "OK")
+
 
 
 def menu() -> None:
@@ -1151,10 +1400,12 @@ def main() -> int:
         if args.action is None:
             menu()
         elif args.action == "setup":
-            with locked():
+            # The periodic guard may momentarily own the state lock.
+            # Wait briefly instead of reporting an avoidable install error.
+            with locked(wait_seconds=6):
                 setup(args.role, args.wheel_url)
         elif args.action == "configure":
-            with locked():
+            with locked(wait_seconds=6):
                 configure(args.remote_ip, args.ssh_user, args.ssh_port, args.identity_file, args.fingerprint)
         elif args.action == "on":
             start_proxy()

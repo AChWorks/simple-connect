@@ -1,4 +1,5 @@
 """Hermetic regression tests. No host-network or production unit mutations."""
+from contextlib import ExitStack, nullcontext
 import hashlib
 import json
 import os
@@ -124,15 +125,20 @@ class SimpleConnectTests(unittest.TestCase):
                             self.assertIn(cidr,args)
                         self.assertEqual(args[-1],"0.0.0.0/0")
 
-    def test_confirm_refuses_same_verified_ssh_session(self):
-        state={"status":"PENDING","op":"ab12","boot":"test","deadline":9999999999,
-               "original_ssh_connection":"203.0.113.10 50000 192.0.2.11 22 8001"}
+    def test_confirm_refuses_preexisting_second_ssh_session(self):
+        state={"status":"PENDING","op":"ab12","boot":"test","deadline_boot":1100,
+               "original_ssh_connection":"203.0.113.10 50000 192.0.2.11 22 8001",
+               "ssh_preexisting":["203.0.113.10 50000 192.0.2.11 22 8001",
+                                  "203.0.113.11 50001 192.0.2.11 22 8002"]}
         from contextlib import nullcontext
-        with patch.object(sc,"require_root"),patch.object(sc,"require_client_role"),patch.object(sc,"locked",return_value=nullcontext()):
-            with patch.object(sc,"read_json",return_value=state),patch.object(sc,"boot_id",return_value="test"):
-                with patch.object(sc,"initial_ssh_connection",return_value=state["original_ssh_connection"]):
-                    with self.assertRaisesRegex(sc.ConnectError,"fresh independent"):
-                        sc.confirm("ab12")
+        with patch.object(sc,"require_root"),patch.object(sc,"require_client_role"):
+            with patch.object(sc,"locked",return_value=nullcontext()):
+                with patch.object(sc,"read_json",return_value=state),patch.object(sc,"boot_id",return_value="test"):
+                    with patch.object(sc,"boot_seconds",return_value=1000):
+                        with patch.object(sc,"initial_ssh_connection",return_value=state["ssh_preexisting"][1]):
+                            with self.assertRaisesRegex(sc.ConnectError,"AFTER activation"):
+                                sc.confirm("ab12")
+
 
     def test_expired_confirmation_never_adopts_a_new_session(self):
         from contextlib import nullcontext
@@ -272,11 +278,84 @@ class SimpleConnectTests(unittest.TestCase):
                         stop.assert_called_once_with("guard")
 
     def test_uninstall_refuses_failed_shutdown_without_erasing_files(self):
-        with patch.object(sc,"require_root"),patch.object(sc,"stop_proxy",side_effect=sc.ConnectError("incomplete stop")):
-            with patch.object(sc,"unit_action") as action:
-                with self.assertRaisesRegex(sc.ConnectError,"incomplete stop"):
-                    sc.uninstall(True)
-                action.assert_not_called()
+        from contextlib import nullcontext
+        with patch.object(sc,"require_root"),patch.object(sc,"require_client_role"):
+            with patch.object(sc,"locked",return_value=nullcontext()):
+                with patch.object(sc,"reserve_uninstall") as reserve,patch.object(sc,"stop_proxy",side_effect=sc.ConnectError("incomplete stop")):
+                    with patch.object(sc,"unit_action") as action:
+                        with self.assertRaisesRegex(sc.ConnectError,"incomplete stop"):
+                            sc.uninstall(True)
+                        reserve.assert_called_once()
+                        action.assert_not_called()
+
+
+    def test_ssh_socket_inventory_captures_all_preexisting_logins(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            (root/"net").mkdir()
+            header="sl local_address rem_address st tx_queue tr when retr uid timeout inode\n"
+            (root/"net"/"tcp").write_text(
+                header+
+                "0: 176433C6:0016 0A7100CB:C350 01 00000000:00000000 00:00000000 00000000 0 0 54321 1\n"+
+                "1: 176433C6:0016 0B7100CB:C351 01 00000000:00000000 00:00000000 00000000 0 0 54322 1\n"
+            )
+            (root/"net"/"tcp6").write_text(header)
+            for pid,inode in ((234,54321),(235,54322)):
+                proc=root/str(pid)
+                proc.mkdir()
+                (proc/"exe").symlink_to("/usr/sbin/sshd-session")
+                (proc/"fd").mkdir()
+                (proc/"fd"/"3").symlink_to(f"socket:[{inode}]")
+            found=sc.ssh_connection_inventory(proc_root=root)
+            self.assertEqual(found,["203.0.113.10 50000 198.51.100.23 22 54321",
+                                    "203.0.113.11 50001 198.51.100.23 22 54322"])
+
+    def test_confirm_accepts_only_new_kernel_proven_remote_ssh(self):
+        from contextlib import nullcontext
+        table={"nftables":[{"table":{"family":"inet","name":"sshuttle-ipv4-23000"}}]}
+        original="203.0.113.10 50000 192.0.2.11 22 8001"
+        second="203.0.113.11 50001 192.0.2.11 22 8002"
+        third="203.0.113.12 50002 192.0.2.11 22 8003"
+        state={"status":"PENDING","op":"ab12","boot":"boot-one","deadline_boot":2000,
+               "table_sha256":sc.table_hash(table),"listen_port":23000,
+               "original_ssh_connection":original,"ssh_preexisting":[original,second]}
+        with patch.object(sc,"require_root"),patch.object(sc,"require_client_role"):
+            with patch.object(sc,"locked",return_value=nullcontext()),patch.object(sc,"read_json",return_value=state):
+                with patch.object(sc,"boot_id",return_value="boot-one"),patch.object(sc,"boot_seconds",return_value=1450):
+                    with patch.object(sc,"is_active",return_value=True),patch.object(sc,"current_table",return_value=table):
+                        with patch.object(sc,"require_external_management_peer") as external,patch.object(sc,"write_json") as saved:
+                            with patch.object(sc,"initial_ssh_connection",return_value=second):
+                                with self.assertRaisesRegex(sc.ConnectError,"AFTER activation"):
+                                    sc.confirm("ab12")
+                            with patch.object(sc,"initial_ssh_connection",return_value=third):
+                                sc.confirm("ab12")
+                            saved.assert_called_once()
+                            self.assertEqual(saved.call_args.args[1]["status"],"ACTIVE")
+                            external.assert_called_once_with("203.0.113.12")
+
+    def test_self_originated_ssh_is_rejected(self):
+        with self.assertRaisesRegex(sc.ConnectError,"Local-only"):
+            sc.require_external_management_peer("127.0.0.1")
+        out=json.dumps([{"addr_info":[{"family":"inet","local":"203.0.113.5"}]}])
+        result=subprocess.CompletedProcess([],0,out,"")
+        with patch.object(sc,"run",return_value=result):
+            with self.assertRaisesRegex(sc.ConnectError,"Self-originated"):
+                sc.require_external_management_peer("203.0.113.5")
+            sc.require_external_management_peer("203.0.113.6")
+
+    def test_boottime_deadline_ignores_wallclock_jumps(self):
+        state={"deadline_boot":1600,"boot":"boot-one"}
+        with patch.object(sc,"boot_seconds",return_value=1599):
+            with patch.object(sc.time,"time",return_value=100000000):
+                self.assertFalse(sc.pending_expired(state))
+        with patch.object(sc,"boot_seconds",return_value=1600):
+            with patch.object(sc.time,"time",return_value=1):
+                self.assertTrue(sc.pending_expired(state))
+        with patch.object(sc,"boot_seconds",return_value=1500):
+            with patch.object(sc.time,"time",return_value=9999999999):
+                self.assertFalse(sc.pending_expired(state))
+        self.assertTrue(sc.pending_expired({"deadline_boot":"broken"}))
+        self.assertTrue(sc.pending_expired({"deadline":9999999999}))
 
     def test_route_discovery_protects_public_onlink_and_gateway(self):
         routes=[
@@ -372,6 +451,233 @@ class SimpleConnectTests(unittest.TestCase):
                 with patch.object(sc,"service_terminated",return_value=False):
                     with self.assertRaises(sc.ConnectError):
                         sc.guard()
+
+    def test_first_client_wheel_failure_is_retryable(self):
+        with tempfile.TemporaryDirectory() as d, ExitStack() as patches:
+            root=Path(d)
+            etc=root/"etc"
+            state_dir=root/"data"
+            patches.enter_context(patch.object(sc,"ETC",etc))
+            patches.enter_context(patch.object(sc,"STATE_DIR",state_dir))
+            patches.enter_context(patch.object(sc,"STATE",state_dir/"state.json"))
+            patches.enter_context(patch.object(sc,"UNIT_DIR",root/"units"))
+            patches.enter_context(patch.object(sc,"CONF",etc/"config.json"))
+            patches.enter_context(patch.object(sc,"SSH_CONF",etc/"ssh_config"))
+            patches.enter_context(patch.object(sc,"KNOWN_HOSTS",etc/"known_hosts"))
+            patches.enter_context(patch.object(sc,"require_root"))
+            patches.enter_context(patch.object(sc,"require_no_teardown"))
+            patches.enter_context(patch.object(sc,"install_requirements"))
+            patches.enter_context(patch.object(sc,"install_entrypoint"))
+            wheel=patches.enter_context(patch.object(sc,"install_wheel",
+                side_effect=[sc.ConnectError("mirror failed"),None,None]))
+            patches.enter_context(patch.object(sc,"unit_texts",return_value={}))
+            patches.enter_context(patch.object(sc,"unit_action"))
+            patches.enter_context(patch.object(sc,"service_terminated",return_value=True))
+            patches.enter_context(patch.object(sc,"any_proxy_tables",return_value=False))
+            patches.enter_context(patch.object(sc,"is_active",return_value=False))
+            patches.enter_context(patch.object(sc,"boot_id",return_value="boot-one"))
+            with self.assertRaisesRegex(sc.ConnectError,"mirror failed"):
+                sc.setup("client","https://mirror.example/wheel")
+            self.assertEqual((etc/"role").read_text().strip(),"client")
+            self.assertEqual(sc.read_json(sc.STATE)["status"],"INSTALLING")
+            sc.setup("client","https://mirror.example/wheel")
+            self.assertEqual(sc.read_json(sc.STATE)["status"],"DIRECT")
+            sc.setup("client","https://mirror.example/wheel")
+            self.assertEqual(sc.read_json(sc.STATE)["status"],"DIRECT")
+            self.assertEqual(wheel.call_count,3)
+
+    def test_first_install_recovers_from_interrupted_unit_or_timer(self):
+        for failing in ("daemon-reload","enable"):
+            with self.subTest(failing=failing):
+                with tempfile.TemporaryDirectory() as d, ExitStack() as patches:
+                    root=Path(d); etc=root/"etc";state_dir=root/"state"
+                    patches.enter_context(patch.object(sc,"ETC",etc))
+                    patches.enter_context(patch.object(sc,"STATE_DIR",state_dir))
+                    patches.enter_context(patch.object(sc,"STATE",state_dir/"state.json"))
+                    patches.enter_context(patch.object(sc,"UNIT_DIR",root/"units"))
+                    patches.enter_context(patch.object(sc,"CONF",etc/"config.json"))
+                    patches.enter_context(patch.object(sc,"SSH_CONF",etc/"ssh_config"))
+                    patches.enter_context(patch.object(sc,"KNOWN_HOSTS",etc/"known_hosts"))
+                    for name in ("require_root","require_no_teardown","install_requirements",
+                                 "install_entrypoint","install_wheel"):
+                        patches.enter_context(patch.object(sc,name))
+                    patches.enter_context(patch.object(sc,"service_terminated",return_value=True))
+                    patches.enter_context(patch.object(sc,"any_proxy_tables",return_value=False))
+                    patches.enter_context(patch.object(sc,"is_active",return_value=False))
+                    patches.enter_context(patch.object(sc,"boot_id",return_value="boot-one"))
+                    patches.enter_context(patch.object(sc,"unit_texts",return_value={
+                        sc.GUARD_TIMER:"# Managed by Simple Connect; do not edit directly.\n[Timer]\n"
+                    }))
+                    counter={"failed":False}
+                    def action(command,*units):
+                        if command==failing and not counter["failed"]:
+                            counter["failed"]=True
+                            raise sc.ConnectError(failing+" failed")
+                    patches.enter_context(patch.object(sc,"unit_action",side_effect=action))
+                    with self.assertRaises(sc.ConnectError):
+                        sc.setup("client","https://mirror.example/wheel")
+                    self.assertEqual(sc.read_json(sc.STATE)["status"],"INSTALLING")
+                    sc.setup("client","https://mirror.example/wheel")
+                    self.assertEqual(sc.read_json(sc.STATE)["status"],"DIRECT")
+
+    def test_legacy_role_without_state_is_retryable_only_when_proven_safe(self):
+        with tempfile.TemporaryDirectory() as d, ExitStack() as patches:
+            root=Path(d); etc=root/"etc"; etc.mkdir()
+            (etc/"role").write_text("client\n")
+            state_dir=root/"data"
+            for field,value in (("ETC",etc),("STATE_DIR",state_dir),("STATE",state_dir/"state.json"),
+                                ("UNIT_DIR",root/"units"),("CONF",etc/"config.json"),
+                                ("SSH_CONF",etc/"ssh_config"),("KNOWN_HOSTS",etc/"known_hosts")):
+                patches.enter_context(patch.object(sc,field,value))
+            for name in ("require_root","require_no_teardown","install_requirements",
+                         "install_entrypoint","install_wheel","unit_action"):
+                patches.enter_context(patch.object(sc,name))
+            patches.enter_context(patch.object(sc,"service_terminated",return_value=True))
+            patches.enter_context(patch.object(sc,"any_proxy_tables",return_value=False))
+            patches.enter_context(patch.object(sc,"is_active",return_value=False))
+            patches.enter_context(patch.object(sc,"boot_id",return_value="boot-one"))
+            patches.enter_context(patch.object(sc,"unit_texts",return_value={}))
+            sc.setup("client","https://mirror.example/wheel")
+            self.assertEqual(sc.read_json(sc.STATE)["status"],"DIRECT")
+
+    def test_teardown_reservation_blocks_on_off_configure_and_setup(self):
+        with tempfile.TemporaryDirectory() as d, ExitStack() as patches:
+            root=Path(d); etc=root/"etc"; etc.mkdir()
+            (etc/"role").write_text("client\n")
+            state_dir=root/"state";state_dir.mkdir()
+            state=state_dir/"state.json"
+            state.write_text('{"schema":1,"status":"DIRECT"}')
+            teardown=state_dir/"uninstalling.json"
+            teardown.write_text('{"schema":1,"status":"REMOVING"}')
+            for field,value in (("ETC",etc),("STATE_DIR",state_dir),("STATE",state),
+                                ("TEARDOWN",teardown),("CONF",etc/"config.json"),
+                                ("SSH_CONF",etc/"ssh_config"),("KNOWN_HOSTS",etc/"known_hosts")):
+                patches.enter_context(patch.object(sc,field,value))
+            patches.enter_context(patch.object(sc,"require_root"))
+            patches.enter_context(patch.object(sc,"locked",return_value=nullcontext()))
+            with self.assertRaisesRegex(sc.ConnectError,"uninstall is pending"):
+                sc.start_proxy()
+            with self.assertRaisesRegex(sc.ConnectError,"uninstall is pending"):
+                sc.stop_proxy()
+            with self.assertRaisesRegex(sc.ConnectError,"uninstall is pending"):
+                sc.configure("8.8.8.8","root",22,"/tmp/key","bad")
+            with self.assertRaisesRegex(sc.ConnectError,"uninstall is pending"):
+                sc.setup("client","https://mirror.example/wheel")
+
+    def test_timer_disable_failure_preserves_code_and_uninstall_marker(self):
+        with tempfile.TemporaryDirectory() as d, ExitStack() as patches:
+            root=Path(d); etc=root/"etc"; etc.mkdir()
+            (etc/"role").write_text("client\n")
+            state_dir=root/"data";state_dir.mkdir()
+            state=state_dir/"state.json"
+            state.write_text('{"schema":1,"status":"DIRECT"}')
+            app=root/"manager.py";app.write_text("installed")
+            teardown=state_dir/"uninstalling.json"
+            for field,value in (("ETC",etc),("STATE_DIR",state_dir),("STATE",state),
+                                ("TEARDOWN",teardown),("APP",app),("UNIT_DIR",root/"units"),
+                                ("CONF",etc/"config.json"),("SSH_CONF",etc/"ssh_config"),
+                                ("KNOWN_HOSTS",etc/"known_hosts")):
+                patches.enter_context(patch.object(sc,field,value))
+            patches.enter_context(patch.object(sc,"require_root"))
+            patches.enter_context(patch.object(sc,"locked",return_value=nullcontext()))
+            patches.enter_context(patch.object(sc,"process_birth",return_value="born"))
+            patches.enter_context(patch.object(sc,"boot_id",return_value="boot-one"))
+            patches.enter_context(patch.object(sc,"service_terminated",return_value=True))
+            patches.enter_context(patch.object(sc,"any_proxy_tables",return_value=False))
+            patches.enter_context(patch.object(sc,"stop_proxy"))
+            patches.enter_context(patch.object(sc,"unit_action",side_effect=sc.ConnectError("timer disable failed")))
+            with self.assertRaisesRegex(sc.ConnectError,"timer disable failed"):
+                sc.uninstall(True)
+            self.assertTrue(teardown.exists())
+            self.assertTrue(app.exists())
+            self.assertTrue((etc/"role").exists())
+            self.assertEqual(sc.read_json(state)["status"],"DIRECT")
+
+    def test_stale_teardown_marker_allows_safe_retry_but_not_concurrent_retry(self):
+        with tempfile.TemporaryDirectory() as d, ExitStack() as patches:
+            root=Path(d);state_dir=root/"data";state_dir.mkdir()
+            teardown=state_dir/"uninstalling.json"
+            with patch.object(sc,"TEARDOWN",teardown),patch.object(sc,"STATE",state_dir/"state.json"):
+                sc.write_json(sc.STATE,{"status":"DIRECT"})
+                sc.write_json(teardown,{"status":"REMOVING","boot":"boot","pid":1234,"birth":"old"})
+                with patch.object(sc,"boot_id",return_value="boot"):
+                    with patch.object(sc,"process_birth",side_effect=lambda pid: "old" if pid==1234 else "now"):
+                        with self.assertRaisesRegex(sc.ConnectError,"Another uninstall"):
+                            sc.reserve_uninstall()
+                    with patch.object(sc,"process_birth",side_effect=lambda pid: "now" if pid==os.getpid() else None):
+                        sc.reserve_uninstall()
+                self.assertEqual(sc.read_json(teardown)["pid"],os.getpid())
+
+    def test_guard_preserves_incomplete_install_state(self):
+        with patch.object(sc,"locked",return_value=nullcontext()),patch.object(sc,"read_json",
+                          return_value={"status":"INSTALLING","boot":"old-boot"}):
+            with patch.object(sc,"service_terminated",return_value=True),patch.object(sc,"any_proxy_tables",return_value=False):
+                with patch.object(sc,"write_json") as save,patch.object(sc,"stop_and_recover") as stop:
+                    sc.guarded_check()
+                    save.assert_not_called()
+                    stop.assert_not_called()
+
+    def test_inflight_on_cannot_commit_after_uninstall_reservation(self):
+        with tempfile.TemporaryDirectory() as d, ExitStack() as patches:
+            root=Path(d);state_dir=root/"state";state_dir.mkdir()
+            state=state_dir/"state.json";teardown=state_dir/"uninstalling.json"
+            patches.enter_context(patch.object(sc,"STATE",state))
+            patches.enter_context(patch.object(sc,"TEARDOWN",teardown))
+            patches.enter_context(patch.object(sc,"require_root"))
+            patches.enter_context(patch.object(sc,"require_client_role"))
+            patches.enter_context(patch.object(sc,"locked",return_value=nullcontext()))
+            patches.enter_context(patch.object(sc,"read_config",return_value={"remote_ip":"8.8.8.8"}))
+            patches.enter_context(patch.object(sc,"ensure_stopped"))
+            patches.enter_context(patch.object(sc,"is_active",return_value=True))
+            patches.enter_context(patch.object(sc,"initial_ssh_connection",
+                              return_value="198.51.100.1 12345 203.0.113.2 22 123"))
+            patches.enter_context(patch.object(sc,"remote_python_test"))
+            patches.enter_context(patch.object(sc,"effective_exclusions",return_value=list(sc.EXCLUDED)))
+            patches.enter_context(patch.object(sc,"choose_port",return_value=24567))
+            patches.enter_context(patch.object(sc,"boot_id",return_value="b"))
+            patches.enter_context(patch.object(sc,"boot_seconds",return_value=1000))
+            table={"nftables":[{"table":{"name":"sshuttle-ipv4-24567","family":"inet"}}]}
+            patches.enter_context(patch.object(sc,"current_table",return_value=table))
+            def concurrent_uninstall(action,*units):
+                if action=="start":
+                    sc.write_json(teardown,{"status":"REMOVING"})
+            patches.enter_context(patch.object(sc,"unit_action",side_effect=concurrent_uninstall))
+            stopped=patches.enter_context(patch.object(sc,"stop_and_recover"))
+            with self.assertRaisesRegex(sc.ConnectError,"uninstall is pending"):
+                sc.start_proxy()
+            stopped.assert_called_once_with("failed_activation")
+            self.assertEqual(sc.read_json(state)["status"],"PENDING")
+            self.assertTrue(teardown.exists())
+
+    def test_service_run_refuses_teardown_marker_before_exec(self):
+        with patch.object(sc,"require_root"),patch.object(sc,"require_client_role"):
+            with patch.object(sc,"require_no_teardown",side_effect=sc.ConnectError("uninstall is pending")):
+                with patch.object(os,"execvpe") as execv:
+                    with self.assertRaisesRegex(sc.ConnectError,"uninstall is pending"):
+                        sc.service_run()
+                    execv.assert_not_called()
+
+    def test_guard_expires_pending_by_boottime_even_if_wall_clock_moves(self):
+        state={"status":"PENDING","boot":"b","deadline_boot":100,"started_boot":30,
+               "table_sha256":"a"*64}
+        with patch.object(sc,"locked",return_value=nullcontext()),patch.object(sc,"read_json",return_value=state):
+            with patch.object(sc,"boot_id",return_value="b"):
+                with patch.object(sc,"boot_seconds",return_value=100):
+                    with patch.object(sc.time,"time",return_value=-1000000000):
+                        with patch.object(sc,"is_active",return_value=True):
+                            with patch.object(sc,"current_table",return_value={"nftables":[]}):
+                                with patch.object(sc,"stop_and_recover") as stop:
+                                    sc.guarded_check()
+                                    stop.assert_called_once_with("guard")
+
+    def test_operator_setup_and_configure_wait_for_guard_lock(self):
+        for action, command in (("setup",["simple_connect.py","setup","client"]),
+                                ("configure",["simple_connect.py","configure"])):
+            with self.subTest(action=action):
+                with patch.object(sys,"argv",command),patch.object(sc,"locked",return_value=nullcontext()) as gate:
+                    with patch.object(sc,action):
+                        self.assertEqual(sc.main(),0)
+                    gate.assert_called_once_with(wait_seconds=6)
 
     def test_bootstrap_hash_matches_manager(self):
         repo = Path(__file__).resolve().parents[1]
