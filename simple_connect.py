@@ -1922,14 +1922,21 @@ def server_host_report(*, probe: bool = False) -> dict:
             ports.append(int(item))
     report["ports"] = list(dict.fromkeys(ports))
     accepted = set(",".join(config.get("hostkeyalgorithms", [])).split(","))
-    paths = config.get("hostkey", [])
-    if not report["configured"]:
-        paths = [str(SSH_HOST_DIR / f"ssh_host_{k}_key")
-                 for k in ("ed25519", "ecdsa", "rsa", "dsa")]
+    configured_paths = config.get("hostkey", [])
+    standard_paths = [str(SSH_HOST_DIR / f"ssh_host_{k}_key")
+                      for k in ("ed25519", "ecdsa", "rsa", "dsa")]
+    # Show configured missing keys AND extra local host keys not configured
+    # in sshd, including obsolete DSA. Never present extra files as enabled.
+    paths = list(dict.fromkeys(
+        configured_paths + [item for item in standard_paths
+                            if not report["configured"] or Path(item + ".pub").exists()
+                            or Path(item + ".pub").is_symlink()]
+    ))
     for item in paths:
         path = Path(item + ".pub")
         entry = {"path": str(path), "type": "UNKNOWN", "fingerprint": "",
-                 "status": "MISSING", "enabled": False}
+                 "status": "PUBLIC KEY MISSING", "private": "NOT VERIFIED",
+                 "enabled": False}
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
             try:
@@ -1961,12 +1968,44 @@ def server_host_report(*, probe: bool = False) -> dict:
                     fail("Local host public key failed ssh-keygen validation.")
                 if kind == "ssh-rsa" and (not detail[0].isdigit() or int(detail[0]) < 2048):
                     fail("Weak RSA host key (under 2048 bits).")
+                # A .pub file alone is not evidence sshd can use its matching
+                # private host key. Verify regular owner-only private material,
+                # then compare only derived PUBLIC halves, never print secrets.
+                private = Path(item)
+                try:
+                    private_stat = os.lstat(private)
+                except FileNotFoundError:
+                    entry["private"] = "MISSING"
+                except OSError as exc:
+                    entry["private"] = f"UNREADABLE ({exc})"
+                else:
+                    if (not stat.S_ISREG(private_stat.st_mode)
+                            or private_stat.st_uid not in (0, os.geteuid())
+                            or private_stat.st_mode & 0o077):
+                        entry["private"] = "UNSAFE TYPE, OWNER OR PERMISSIONS"
+                    else:
+                        try:
+                            derived = run(["ssh-keygen", "-y", "-P", "",
+                                           "-f", str(private)], timeout=12)
+                            derived_type, derived_blob = single_public_record(
+                                derived.stdout.encode("utf-8"))
+                            entry["private"] = ("PAIR MATCH" if (derived_type, derived_blob) == (kind, blob)
+                                                else "PUBLIC/PRIVATE KEY MISMATCH")
+                        except (ConnectError, OSError) as exc:
+                            entry["private"] = f"PAIR UNVERIFIED ({exc})"
                 allowed = host_key_signature_algorithms(kind).split(",")
-                entry["enabled"] = report["configured"] and bool(accepted.intersection(allowed))
-                if not report["configured"]:
+                entry["enabled"] = (entry["private"] == "PAIR MATCH"
+                                    and report["configured"]
+                                    and bool(accepted.intersection(allowed)))
+                if entry["private"] != "PAIR MATCH":
+                    entry["status"] = f"HOST KEY NOT READY: private {entry['private']}"
+                elif not report["configured"]:
                     entry["status"] = "FILE PRESENT; effective config unknown"
+                elif item not in configured_paths:
+                    entry["enabled"] = False
+                    entry["status"] = "FILE PRESENT; NOT configured by sshd"
                 elif entry["enabled"]:
-                    entry["status"] = "FILE PRESENT; configured/algorithm enabled; offering UNVERIFIED"
+                    entry["status"] = "FILE PRESENT; matched pair, configured/algorithm enabled; listener UNVERIFIED"
                 else:
                     entry["status"] = "FILE PRESENT; host-key algorithm disabled"
         except FileNotFoundError:
@@ -2031,11 +2070,21 @@ def show_server_host_fingerprints(*, probe: bool = True) -> None:
 
 
 def status() -> None:
-    if (ETC / "role").is_file() and (ETC / "role").read_text().strip() == "server":
+    role = ETC / "role"
+    if role.is_symlink():
+        fail("Unsafe role path (symlink); status cannot be trusted.")
+    if not role.is_file():
+        print(f"Simple Connect: {VERSION}")
+        print("Role: NOT INSTALLED")
+        print("State: NOT INSTALLED (no Simple Connect network state verified)")
+        return
+    if role.read_text().strip() == "server":
         print(f"Simple Connect: {VERSION} | SERVER (no proxy/tunnel)")
         show_server_host_fingerprints(probe=False)
         return
-    state = read_json(STATE, {"status": "DIRECT"})
+    if role.read_text().strip() != "client":
+        fail("Unknown Simple Connect role; inspect role file, no network state inferred.")
+    state = read_json(STATE, {"status": "UNKNOWN"})
     print(f"Simple Connect: {VERSION}")
     role = (ETC / "role").read_text().strip().upper() if (ETC / "role").is_file() else "NOT SET UP"
     print(f"Role: {role}")
@@ -2359,7 +2408,7 @@ def menu_snapshot() -> dict[str, str]:
         result["remote"] = "n/a (SSH endpoint)"
         info = server_host_report(probe=False)
         eligible = [item for item in info["keys"] if item["enabled"]]
-        result["key"] = (f"{', '.join(item['type'] for item in eligible)} (offering unverified)"
+        result["key"] = (f"{', '.join(item['type'] for item in eligible)} (key pairs checked; listener unverified)"
                          if eligible else "NO VERIFIED SUPPORTED HOST KEY")
         if not eligible or not info["active"]:
             result["note"] = "SSH host key or service readiness unverified; see SERVER fingerprints."

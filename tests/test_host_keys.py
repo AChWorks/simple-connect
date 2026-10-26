@@ -198,6 +198,7 @@ class HostKeyTests(unittest.TestCase):
                     return original(argv, **kw)
                 raise AssertionError(f"Unexpected command: {argv}")
             with patch.object(sc, "ETC", folder), (
+                 patch.object(sc, "SSH_HOST_DIR", folder)), (
                  patch.object(sc.shutil, "which", return_value="/usr/sbin/sshd")), (
                  patch.object(sc, "is_active", return_value=True)), (
                  patch.object(sc, "run", side_effect=fake)):
@@ -207,11 +208,12 @@ class HostKeyTests(unittest.TestCase):
                 self.assertEqual(report["keys"][0]["type"], "ssh-rsa")
                 self.assertTrue(report["keys"][0]["enabled"])
                 self.assertIn("UNVERIFIED", report["keys"][0]["status"])
+                self.assertEqual(report["keys"][0]["private"], "PAIR MATCH")
                 with patch.object(sc, "require_root"):
                     with contextlib.redirect_stdout(io.StringIO()) as out:
                         sc.show_server_host_fingerprints(probe=False)
                     self.assertIn(report["keys"][0]["fingerprint"], out.getvalue())
-            self.assertEqual(len(calls), 4)
+            self.assertEqual(len(calls), 6)
             self.assertTrue(pub.is_file())
             self.assertFalse(any(x[0] == "ssh-keyscan" for x in calls))
 
@@ -295,6 +297,136 @@ class HostKeyTests(unittest.TestCase):
             with patch.object(sc, "ETC", folder), patch.object(sc, "require_root"):
                 with self.assertRaisesRegex(sc.ConnectError, "SERVER role"):
                     sc.show_server_host_fingerprints(probe=False)
+
+    def test_repeated_server_setup_displays_identity_without_key_mutation(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            etc = folder / "etc"
+            etc.mkdir()
+            key = self.key(folder, "server_host", "ecdsa", 256)
+            pub = Path(str(key) + ".pub")
+            original_public = pub.read_bytes()
+            original_private = key.read_bytes()
+            original = sc.run
+            calls = []
+            config = (f"port 45222\nhostkey {key}\n"
+                      "hostkeyalgorithms ecdsa-sha2-nistp256\n")
+            def fake(argv, **kw):
+                calls.append(argv)
+                if argv[0] == "/usr/sbin/sshd":
+                    return subprocess.CompletedProcess(argv, 0, config, "")
+                return original(argv, **kw)
+            with contextlib.ExitStack() as stack:
+                for name, value in (
+                    ("ETC", etc), ("CONF", etc/"config.json"),
+                    ("STATE", folder/"state.json")):
+                    stack.enter_context(patch.object(sc, name, value))
+                stack.enter_context(patch.object(sc, "require_root"))
+                stack.enter_context(patch.object(sc, "SSH_HOST_DIR", folder))
+                stack.enter_context(patch.object(sc, "require_no_teardown"))
+                stack.enter_context(patch.object(sc, "install_requirements"))
+                stack.enter_context(patch.object(sc, "install_entrypoint"))
+                stack.enter_context(patch.object(sc.shutil, "which",
+                                                 side_effect=lambda name: "/usr/sbin/sshd" if name == "sshd" else None))
+                stack.enter_context(patch.object(sc, "is_active",
+                                                 side_effect=lambda unit: unit == "ssh.service"))
+                stack.enter_context(patch.object(sc, "run", side_effect=fake))
+                with contextlib.redirect_stdout(io.StringIO()) as first:
+                    sc.setup("server", "ignored-wheel")
+                with contextlib.redirect_stdout(io.StringIO()) as second:
+                    sc.setup("server", "ignored-wheel")
+            self.assertIn("SHA256:", first.getvalue())
+            self.assertIn("SHA256:", second.getvalue())
+            self.assertIn("ecdsa-sha2-nistp256", second.getvalue())
+            self.assertEqual((etc/"role").read_text(), "server\n")
+            self.assertEqual(pub.read_bytes(), original_public)
+            self.assertEqual(key.read_bytes(), original_private)
+            self.assertFalse(any(command[0] in ("ssh-keyscan", "systemctl") for command in calls))
+
+    def test_missing_ed25519_does_not_invalidate_configured_ecdsa(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            role = folder / "role"
+            role.write_text("server\n")
+            ecdsa = self.key(folder, "host_ecdsa", "ecdsa", 256)
+            missing = folder/"ssh_host_ed25519_key"
+            config = (f"port 45456\nhostkey {missing}\n"
+                      f"hostkey {ecdsa}\n"
+                      "hostkeyalgorithms ecdsa-sha2-nistp256,ssh-ed25519\n")
+            original = sc.run
+            def fake(argv, **kw):
+                if argv[0] == "/usr/sbin/sshd":
+                    return subprocess.CompletedProcess(argv, 0, config, "")
+                return original(argv, **kw)
+            with patch.object(sc, "ETC", folder), (
+                 patch.object(sc, "SSH_HOST_DIR", folder)), (
+                 patch.object(sc.shutil, "which", side_effect=lambda name:
+                             "/usr/sbin/sshd" if name == "sshd" else None)), (
+                 patch.object(sc, "is_active", return_value=True)), (
+                 patch.object(sc, "run", side_effect=fake)):
+                report = sc.server_host_report(probe=False)
+            self.assertEqual([entry["status"] for entry in report["keys"]][0], "PUBLIC KEY MISSING")
+            self.assertTrue(report["keys"][1]["enabled"])
+            self.assertIn("SHA256:", report["keys"][1]["fingerprint"])
+            self.assertNotIn("OBSERVED", report["keys"][1]["status"])
+
+    def test_not_installed_status_never_claims_direct(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(sc, "ETC", Path(d)), (
+                 contextlib.redirect_stdout(io.StringIO())) as output:
+                sc.status()
+            self.assertIn("Role: NOT INSTALLED", output.getvalue())
+            self.assertNotIn("State: DIRECT", output.getvalue())
+
+    def test_role_symlink_status_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            (folder / "real").write_text("server\n")
+            (folder / "role").symlink_to(folder / "real")
+            with patch.object(sc, "ETC", folder):
+                with self.assertRaisesRegex(sc.ConnectError, "Unsafe role"):
+                    sc.status()
+
+    def test_missing_private_host_key_never_claims_ready(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder=Path(d)
+            host=self.key(folder,"unpaired","ed25519")
+            host.unlink()
+            config=f"port 55555\nhostkey {host}\nhostkeyalgorithms ssh-ed25519\n"
+            original=sc.run
+            def command(argv, **kwargs):
+                if argv[0] == "/usr/sbin/sshd":
+                    return subprocess.CompletedProcess(argv,0,config,"")
+                return original(argv, **kwargs)
+            with patch.object(sc,"SSH_HOST_DIR",folder), (
+                 patch.object(sc.shutil,"which",return_value="/usr/sbin/sshd")), (
+                 patch.object(sc,"is_active",return_value=True)), (
+                 patch.object(sc,"run",side_effect=command)):
+                report=sc.server_host_report(probe=False)
+            self.assertEqual(report["keys"][0]["private"],"MISSING")
+            self.assertFalse(report["keys"][0]["enabled"])
+            self.assertIn("NOT READY", report["keys"][0]["status"])
+
+    def test_mismatched_private_host_key_never_claims_ready(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder=Path(d)
+            first=self.key(folder,"host","ed25519")
+            second=self.key(folder,"other","ed25519")
+            Path(str(first)+".pub").write_bytes(Path(str(second)+".pub").read_bytes())
+            config=f"port 55555\nhostkey {first}\nhostkeyalgorithms ssh-ed25519\n"
+            original=sc.run
+            def command(argv, **kwargs):
+                if argv[0] == "/usr/sbin/sshd":
+                    return subprocess.CompletedProcess(argv,0,config,"")
+                return original(argv, **kwargs)
+            with patch.object(sc,"SSH_HOST_DIR",folder), (
+                 patch.object(sc.shutil,"which",return_value="/usr/sbin/sshd")), (
+                 patch.object(sc,"is_active",return_value=True)), (
+                 patch.object(sc,"run",side_effect=command)):
+                report=sc.server_host_report(probe=False)
+            self.assertEqual(report["keys"][0]["private"],"PUBLIC/PRIVATE KEY MISMATCH")
+            self.assertFalse(report["keys"][0]["enabled"])
+            self.assertIn("NOT READY", report["keys"][0]["status"])
 
 
 if __name__ == "__main__":
