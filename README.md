@@ -5,11 +5,13 @@ A small, standalone SSH-based outbound connectivity manager for Linux hosting se
 - **SERVER (remote SSH endpoint):** check or install missing Python/SSH prerequisites and display the SSH ED25519 host fingerprint. It does not create a public proxy, user or credentials.
 - **CLIENT (Iran-side host):** install the verified official sshuttle **2.0.0** wheel without changing system Python packages; configure pinned SSH identity; manage transparent outbound IPv4 TCP and conventional UDP/53 DNS.
 
-**Status: DEVELOPMENT CANDIDATE. No live-host acceptance, stable release, or deployed mirror. Do NOT run ON on a hosting/production server yet.**
+**Status: [v0.1.0 GitHub pre-release](https://github.com/AChWorks/simple-connect/releases/tag/v0.1.0) — reviewed source and distribution, NOT production-field-accepted. The default HTTPS mirror has not been deployed. Do NOT run ON on a live hosting/production server without separately authorized host-specific field acceptance.**
 
 Simple Connect is intentionally separate from [Server Connect](https://github.com/AChWorks/server-connect). It does not use sing-box, alter the default route, provide general UDP/QUIC, or open foreign inbound access to websites.
 
-## One-line install (after review, merge, release and field acceptance)
+## Distribution and installer (live-host acceptance still required)
+
+The [v0.1.0 GitHub pre-release](https://github.com/AChWorks/simple-connect/releases/tag/v0.1.0) publishes a verified four-file archive and detached ZIP checksum. These installer entry points exist, but no host-specific production activation has been accepted. The GitHub raw `main` installer is mutable; for an immutable distribution, use the tagged Release assets and verify their authenticity and checksum before use.
 
 Primary GitHub installer (both roles, interactive role selection):
 
@@ -43,7 +45,13 @@ mirror one-liner is not functional.
 
 The bootstrap verifies the manager's embedded pinned SHA-256. The manager independently verifies the official upstream wheel SHA-256 even when downloaded from the mirror. A malicious replacement of the **bootstrap itself** could also replace its checksum: trust the mirror or verify the bootstrap checksum against an authenticated independent source *before running it as root*. The build script below emits SHA256SUMS for independent comparison. Do not treat HTTPS or a self-supplied checksum alone as publisher authentication.
 
-After approval, the permanent version-matched GitHub Release must provide a `simple-connect-mirror.zip` archive and a separate `simple-connect-mirror.zip.sha256` checksum. Any user may extract those **same four files** into any trusted HTTPS-served directory and invoke the installer with `--mirror https://their.example/path`. Neither a temporary Actions artifact nor a self-served checksum alone proves publisher authenticity.
+The [v0.1.0 GitHub pre-release](https://github.com/AChWorks/simple-connect/releases/tag/v0.1.0) provides the permanent `simple-connect-mirror.zip` archive and separate `simple-connect-mirror.zip.sha256` checksum. Verify the downloaded pair:
+
+~~~bash
+sha256sum -c simple-connect-mirror.zip.sha256
+~~~
+
+The reviewed v0.1.0 ZIP SHA256 is `b0e6c276d13bdf7d8b3b63bb00560d2f744933c20d4859bb00435306c65a533c` and its tag points to commit `d1d905f9eb1c732314234485c7526c6c71f40965`. The archive contains the same **four flat files** used by any trusted, operator-hosted HTTPS mirror (`--mirror https://their.example/path`). An independently trusted source is still needed to authenticate the bootstrap: a checksum retrieved solely from the same untrusted server is not proof of publisher identity.
 
 Prepare an independent mirror folder using:
 
@@ -69,10 +77,11 @@ release builder also requires staged manager and installer files to match
 the checked-out sources. It rejects a `-dev` version, mismatched checksums,
 missing licensing and unexpected mirror entries. It uses fixed ZIP metadata
 and no compression for stable byte-for-byte archives. CI checks repeatability
-and uploads the pair as **temporary** artifacts; these are not a public GitHub Release. Publish
-the matching tag and two permanent Release assets only after explicit
-Owner authorization and relevant review/CI gates. Extraction and hosting
-the four files on a trusted custom HTTPS mirror remain operator-controlled.
+and uploads the pair as **temporary** artifacts; the separate GitHub pre-release
+above hosts the permanent assets. Future tags and public Release publication
+still require explicit Owner authorization and relevant review/CI gates.
+Extraction and hosting the four files on a trusted custom HTTPS mirror
+remain operator-controlled and have not been performed on helpe.ir.
 
 The mirror hostname is owner-selected; its web-root storage and actual file deployment remain owner-managed. Even with the mirror, operating-system apt prerequisites must be obtainable from a configured Debian/local mirror. The setup process only installs **missing** apt packages and never performs a blanket apt upgrade.
 
@@ -115,7 +124,7 @@ OFF restores Direct routing (which may still have blocked international download
 - No automatic proxy reconnection loop, no generic whole-host killswitch, no default-route changes, no global firewall flush. By default failure recovers the original Direct state, not necessarily foreign connectivity.
 - Initial target: Debian 13 amd64 with systemd, nftables, iproute2, **Python >=3.10 and <4.0** on both local and SSH remote, and working remote SSH. Other systems have not been accepted.
 - Pinned official sshuttle 2.0.0 is installed in /opt/simple-connect/sshuttle. It is not installed into global pip. Repeated setup skips a correct, verified installation.
-- IMPORTANT: Prior disconnected Docker guest tests exercised basic ON/OFF, new SSH confirmation, a simulated unconfirmed deadline, SIGKILL, guard shutdown, concurrent foreign rule preservation, and a pending Docker PID1 restart. Remediation of independent review findings changes these paths and requires fresh bounded regression; not every crash timing can be tested. Those tests are **not** physical host/kernel reboot, mixed production firewall/conntrack acceptance, or proof of all possible partial network mutations. Full field evidence and fresh high-assurance independent review remain required **before shipping or executing ON on real hosting**.
+- IMPORTANT: Author-operated isolated Debian 13 systemd/SSH guest tests exercised basic ON/OFF, new SSH confirmation, a simulated unconfirmed deadline, SIGKILL, guard shutdown, foreign-rule preservation, and nine interrupted-uninstall recovery checkpoints. Independent high-assurance reviewers approved the exact source and release-preparation candidates, but did **not** independently reproduce the guest or physical host tests. Neither CI nor isolated guest evidence establishes physical reboot behavior, live hosting SSH recovery, aaPanel/website response safety, mixed production firewall/conntrack acceptance, or all partial failure timings. Separately authorized, host-specific field acceptance is still required **before executing ON on real hosting**.
 
 ## Development checks
 
