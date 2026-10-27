@@ -2337,7 +2337,12 @@ def status() -> None:
     table = current_table(state) if nft_available and label != "DIRECT" else None
     untracked = any_proxy_tables() if label == "DIRECT" and nft_available else False
     expected_sha = state.get("table_sha256")
-    verified_table = (table is not None and isinstance(expected_sha, str)
+    # table_hash() persists hashlib.hexdigest(): exactly 64 lowercase hex
+    # characters. Noncanonical/malformed values cannot establish ownership,
+    # and must not be reported as a valid but changed recorded fingerprint.
+    valid_sha = (isinstance(expected_sha, str)
+                 and re.fullmatch(r"[0-9a-f]{64}", expected_sha) is not None)
+    verified_table = (table is not None and valid_sha
                       and table_is_ours(table, expected_sha))
     # ACTIVE is a persisted state label, not proof of safe firewall ownership.
     # Do not give that overall label a green health cue while the observation
@@ -2345,7 +2350,7 @@ def status() -> None:
     if label == "ACTIVE":
         if not active or not guard_active or (nft_available and table is None):
             tone = "error"
-        elif not nft_available or not isinstance(expected_sha, str) or not expected_sha:
+        elif not nft_available or not valid_sha:
             tone = "warn"
         else:
             tone = "good" if verified_table else "error"
@@ -2386,8 +2391,11 @@ def status() -> None:
     else:
         # A matching table name proves presence only, never ownership. Do not
         # show green unless the *full* persisted snapshot hash verifies.
-        if not isinstance(expected_sha, str) or not expected_sha:
-            identity, table_tone = "UNVERIFIED (no saved SHA256)", "warn"
+        if not valid_sha:
+            missing = expected_sha is None or expected_sha == ""
+            identity = ("UNVERIFIED (no saved SHA256)" if missing
+                        else "UNVERIFIED (invalid SHA256)")
+            table_tone = "warn"
         elif verified_table:
             identity, table_tone = "MATCH", "good"
         else:
@@ -2395,7 +2403,7 @@ def status() -> None:
         terminal_field("Owned nftables table", "present", tone=table_tone)
         terminal_field("Table identity", identity, tone=table_tone)
         if identity.startswith("UNVERIFIED"):
-            terminal_warning("Table ownership cannot be verified without a recorded SHA256; "
+            terminal_warning("Table ownership cannot be verified without a valid saved SHA256; "
                              "do not adopt or delete it.")
         elif identity == "CHANGED":
             terminal_warning("Table differs from recorded ownership SHA256; "

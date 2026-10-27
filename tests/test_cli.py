@@ -690,8 +690,23 @@ class StatusOwnershipColorsTests(unittest.TestCase):
             ("missing-hash", {}, table, "present", "UNVERIFIED (no saved SHA256)", "warn"),
             ("empty-hash", {"table_sha256": ""}, table, "present",
              "UNVERIFIED (no saved SHA256)", "warn"),
-            ("invalid-hash", {"table_sha256": None}, table, "present",
+            ("null-hash", {"table_sha256": None}, table, "present",
              "UNVERIFIED (no saved SHA256)", "warn"),
+            ("nonstring-hash", {"table_sha256": 17}, table, "present",
+             "UNVERIFIED (invalid SHA256)", "warn"),
+            ("nonstr-list-hash", {"table_sha256": []}, table, "present",
+             "UNVERIFIED (invalid SHA256)", "warn"),
+            ("malformed-word", {"table_sha256": "not-a-sha256"}, table, "present",
+             "UNVERIFIED (invalid SHA256)", "warn"),
+            ("malformed-short-hex", {"table_sha256": "abc123"}, table, "present",
+             "UNVERIFIED (invalid SHA256)", "warn"),
+            ("truncated-digest", {"table_sha256": good_sha[:63]}, table, "present",
+             "UNVERIFIED (invalid SHA256)", "warn"),
+            ("nonhex-full-length", {"table_sha256": "g" * 64}, table, "present",
+             "UNVERIFIED (invalid SHA256)", "warn"),
+            # The persisted manager digest is canonical lowercase hexdigest.
+            ("noncanonical-uppercase", {"table_sha256": good_sha.upper()}, table, "present",
+             "UNVERIFIED (invalid SHA256)", "warn"),
             ("changed", {"table_sha256": "f" * 64}, table, "present", "CHANGED", "error"),
             ("match", {"table_sha256": good_sha}, table, "present", "MATCH", "good"),
             ("absent", {"table_sha256": good_sha}, None, "absent", "ABSENT", "error"),
@@ -727,7 +742,7 @@ class StatusOwnershipColorsTests(unittest.TestCase):
                             self.assertIn(color[tone] + "ACTIVE\033[0m", raw)
                         if tone != "good":
                             self.assertNotIn(color["good"] + "present\033[0m", raw)
-                        if name in ("missing-hash", "empty-hash", "invalid-hash", "changed"):
+                        if tone != "good" and observed is not None:
                             self.assertIn("WARNING:", raw)
                             unstyled = re.sub(r"\x1b\[[0-9;]*m", "", raw)
                             self.assertIn("do not adopt or delete",
@@ -740,8 +755,21 @@ class StatusOwnershipColorsTests(unittest.TestCase):
                         self.assertNotIn("\033[", text)
                         self.assertIn("Owned nftables table: " + table_text, text)
                         self.assertIn("Table identity: " + identity, text)
+                        # Redirected/non-TTY stdout must preserve exact labels
+                        # and warning semantics without any ANSI escape bytes.
+                        with patch.dict(os.environ, {"TERM": "xterm"}, clear=True), (
+                             contextlib.redirect_stdout(io.StringIO())) as redirected:
+                            sc.status()
+                        plain_non_tty = redirected.getvalue()
+                        self.assertNotIn("\033[", plain_non_tty)
+                        self.assertIn("Table identity: " + identity, plain_non_tty)
+                        self.assertIn("Owned nftables table: " + table_text, plain_non_tty)
+                        if "UNVERIFIED" in identity:
+                            self.assertNotIn("Table identity: CHANGED", plain_non_tty)
+                        if identity == "CHANGED":
+                            self.assertNotIn("Table identity: UNVERIFIED", plain_non_tty)
                         lookup.assert_called_with(state)
-                        self.assertEqual(lookup.call_count, 2)
+                        self.assertEqual(lookup.call_count, 3)
                         run.assert_not_called()
                         write.assert_not_called()
                         unit.assert_not_called()
@@ -750,28 +778,31 @@ class StatusOwnershipColorsTests(unittest.TestCase):
     def test_unverified_firewall_warning_wraps_at_40_columns(self):
         table = {"nftables": [{"table": {"family": "inet",
                                           "name": "sshuttle-ipv4-23456"}}]}
-        with tempfile.TemporaryDirectory() as d:
-            (Path(d) / "role").write_text("client\n")
-            with (
-                patch.object(sc, "ETC", Path(d)),
-                patch.object(sc, "read_json", return_value={
-                    "status": "PENDING", "listen_port": 23456,
-                }),
-                patch.object(sc, "is_active", return_value=True),
-                patch.object(sc.shutil, "which", return_value="/usr/sbin/nft"),
-                patch.object(sc, "current_table", return_value=table),
-                patch.object(sc.shutil, "get_terminal_size",
-                             return_value=os.terminal_size((40, 25))),
-                patch.object(sc.sys, "stdout", TerminalBuffer()) as output,
-                patch.dict(os.environ, {"TERM": "xterm"}, clear=True),
-            ):
-                sc.status()
-            raw = output.getvalue()
-            plain = re.sub(r"\x1b\[[0-9;]*m", "", raw)
-            self.assertIn("UNVERIFIED", plain)
-            self.assertIn("\033[1;33m", raw)
-            self.assertTrue(all(len(line) <= 39 for line in plain.splitlines()),
-                            plain)
+        for saved in ({}, {"table_sha256": "not-a-sha256"},
+                      {"table_sha256": "g" * 64}):
+            with self.subTest(saved=saved), tempfile.TemporaryDirectory() as d:
+                (Path(d) / "role").write_text("client\n")
+                with (
+                    patch.object(sc, "ETC", Path(d)),
+                    patch.object(sc, "read_json", return_value={
+                        "status": "PENDING", "listen_port": 23456, **saved,
+                    }),
+                    patch.object(sc, "is_active", return_value=True),
+                    patch.object(sc.shutil, "which", return_value="/usr/sbin/nft"),
+                    patch.object(sc, "current_table", return_value=table),
+                    patch.object(sc.shutil, "get_terminal_size",
+                                 return_value=os.terminal_size((40, 25))),
+                    patch.object(sc.sys, "stdout", TerminalBuffer()) as output,
+                    patch.dict(os.environ, {"TERM": "xterm"}, clear=True),
+                ):
+                    sc.status()
+                raw = output.getvalue()
+                plain = re.sub(r"\x1b\[[0-9;]*m", "", raw)
+                self.assertIn("UNVERIFIED", plain)
+                self.assertIn("\033[1;33m", raw)
+                self.assertNotIn("Table identity: CHANGED", plain)
+                self.assertTrue(all(len(line) <= 39 for line in plain.splitlines()),
+                                plain)
 
     def test_missing_nft_cannot_claim_verified_firewall(self):
         for label in ("ACTIVE", "PENDING", "DIRECT"):
