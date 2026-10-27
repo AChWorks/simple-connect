@@ -73,6 +73,9 @@ class InteractivePTYTests(unittest.TestCase):
                        and line.lstrip()[:1].isdigit()
                        and ")" in line[:8]]
             self.assertEqual(len(options), 13)
+            numbers = [int(line.strip().split(")", 1)[0]) for line in options]
+            self.assertEqual(numbers, list(range(1, 13)) + [0],
+                             "Menu shortcuts must appear in natural ascending order.")
             self.assertTrue(all(len(line) <= 39 for line in main.splitlines()))
 
             invalid = enter(b"abc\n", b"Press Enter to return to the menu")

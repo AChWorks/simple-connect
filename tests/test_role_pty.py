@@ -25,7 +25,7 @@ MANAGER = ROOT / "simple_connect.py"
 
 
 class Session:
-    def __init__(self, role: str, variant: str, width: int):
+    def __init__(self, role: str, variant: str, width: int, *, color: bool = False):
         self.temp = tempfile.TemporaryDirectory(prefix="sc-role-pty-")
         self.root = Path(self.temp.name)
         self.master, slave = pty.openpty()
@@ -35,16 +35,21 @@ class Session:
         attrs[3] &= ~termios.ECHO
         termios.tcsetattr(slave, termios.TCSANOW, attrs)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 35, width, 0, 0))
+        env = {**os.environ, "SC_PTY_FIXTURE_ROOT": str(self.root),
+               "SC_PTY_FIXTURE_ROLE": role, "SC_PTY_FIXTURE_VARIANT": variant,
+               "TERM": "xterm-256color" if color else "dumb", "PYTHONUNBUFFERED": "1"}
+        if color:
+            env.pop("NO_COLOR", None)
+        else:
+            env["NO_COLOR"] = "1"
         self.proc = subprocess.Popen(
             [sys.executable, str(FIXTURE)],
             cwd=ROOT, stdin=slave, stdout=slave, stderr=slave,
-            start_new_session=True,
-            env={**os.environ, "SC_PTY_FIXTURE_ROOT": str(self.root),
-                 "SC_PTY_FIXTURE_ROLE": role, "SC_PTY_FIXTURE_VARIANT": variant,
-                 "NO_COLOR": "1", "TERM": "dumb", "PYTHONUNBUFFERED": "1"},
+            start_new_session=True, env=env,
         )
         os.close(slave)
         self.width = width
+        self.color = color
 
     def __enter__(self):
         return self
@@ -95,7 +100,7 @@ class Session:
 
     def back_to_menu(self):
         self.send("\n")
-        return self.expect("Choose:")
+        return self.expect("\x1b[0m: " if self.color else "Choose:")
 
     def finish(self):
         self.send("0\n")
@@ -154,6 +159,29 @@ class InstalledRolePTYTests(unittest.TestCase):
                     self.assertIn("CLIENT role", denied)
                     s.back_to_menu()
                     s.finish()
+
+    def test_colored_role_pty_keeps_menu_order_and_plain_copy_ready_fingerprint(self):
+        for width in (40, 80):
+            with self.subTest(width=width), Session("server", "ed", width, color=True) as s:
+                intro = s.expect("\x1b[0m: ", timeout=25)
+                self.assertIn("\x1b[1;36m", intro)  # group headings
+                self.assertIn("\x1b[1;31m", intro)  # destructive option
+                self.assertIn("SERVER fingerprints/Advanced", intro)
+                # The escape sequence must never be spliced into a shortcut label.
+                plain = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", intro)
+                menu = plain[plain.index("MAIN MENU"):]
+                values = [int(v) for v in re.findall(r"(?m)^\s+(\d+)\) ", menu)]
+                self.assertEqual(values, list(range(1, 13)) + [0])
+                s.send("12\n")
+                display = s.expect("[y/N]")
+                fp = s.metadata(intro, "FP")
+                self.assertIn("\r\n" + fp + "\r\n", display,
+                              "Public host fingerprint must stay a single copy-ready line.")
+                self.assertIn("\x1b[1;33m", intro)  # caution in initial server summary
+                s.send("n\n")
+                s.expect("Press Enter to return to the menu")
+                s.back_to_menu()
+                s.finish()
 
     def test_client_bad_input_mismatch_retry_and_successful_reentry(self):
         for width in (40, 80):
@@ -276,6 +304,9 @@ class InstalledRolePTYTests(unittest.TestCase):
                 s.back_to_menu()
                 s.send("3\n")
                 s.expect("1/5 SERVER")
+                # Wait for the full prompt before interrupting input(), not its rendering.
+                s.expect("(b=back): ")
+                time.sleep(0.15)  # Let the child enter its blocking terminal read.
                 s.proc.send_signal(signal.SIGINT)
                 interrupted = s.expect("Press Enter to return to the menu")
                 self.assertIn("Operation interrupted", interrupted)

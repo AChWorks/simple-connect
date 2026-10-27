@@ -33,7 +33,7 @@ import time
 import urllib.request
 import zipfile
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 SCHEMA_VERSION = 1
 SSHUTTLE_VERSION = "2.0.0"
 WHEEL_SHA256 = "506a8cad2f047ca42f0d784654cb3459e2193bfad79d0a03734e0e07473f2bbb"
@@ -96,8 +96,14 @@ class ConnectError(Exception):
 
 
 def color_enabled() -> bool:
+    """ANSI only on a real, capable terminal; plain output remains parseable."""
     return (sys.stdout.isatty() and "NO_COLOR" not in os.environ
-            and os.environ.get("TERM", "") != "dumb")
+            and os.environ.get("TERM", "").lower() not in ("", "dumb"))
+
+
+def terminal_width() -> int:
+    """Leave one column for a safe PTY margin; cap long desktop lines."""
+    return max(24, min(88, shutil.get_terminal_size(fallback=(80, 24)).columns - 1))
 
 
 def paint(value: str, tone: str) -> str:
@@ -107,8 +113,15 @@ def paint(value: str, tone: str) -> str:
 
 
 def say(message: str, kind: str = "INFO") -> None:
+    """Semantic text labels work without color; wrap long notices on real PTYs."""
     tone = {"OK": "good", "WARN": "warn", "ERROR": "error", "INFO": "heading"}
-    print(f"{paint(f'[{kind}]', tone.get(kind, 'heading'))} {message}", flush=True)
+    prefix = f"[{kind}]"
+    rows = ([message] if not sys.stdout.isatty()
+            else textwrap.wrap(message, width=max(18, terminal_width() - len(prefix) - 1),
+                               break_long_words=False, break_on_hyphens=False) or [""])
+    print(f"{paint(prefix, tone.get(kind, 'heading'))} {rows[0]}", flush=True)
+    for row in rows[1:]:
+        print(" " * (len(prefix) + 1) + row, flush=True)
 
 
 def guidance(message: str) -> str:
@@ -134,7 +147,7 @@ def guidance(message: str) -> str:
 def show_error(exc: BaseException) -> None:
     message = str(exc).strip() or type(exc).__name__
     say(message, "ERROR")
-    print(f"  {paint('Next:', 'heading')} {guidance(message)}")
+    terminal_note("Next: " + guidance(message), tone="heading")
 
 
 def fail(message: str) -> None:
@@ -698,10 +711,10 @@ SAFE_KEY_PATH = re.compile(r"/[A-Za-z0-9_./-]+")
 def checked_key_name(value: str) -> Path:
     stripped = value.strip()
     if stripped.upper().startswith("SHA256:"):
-        fail("That SHA256 value is the SERVER host fingerprint, not a CLIENT "
-             "private-key file path. Enter an absolute path to a private key "
-             "on this CLIENT (for example /root/.ssh/simple_connect_ed25519). "
-             "The SERVER fingerprint is requested separately in step 5.")
+        fail("SERVER host fingerprint pasted into the CLIENT private-key FILE "
+             "path. Step 4 needs an absolute filename on this CLIENT "
+             "(for example /root/.ssh/simple_connect_ed25519). "
+             "Use the SHA256 value separately in step 5.")
     if stripped.lower().startswith(("ssh-", "ecdsa-sha2-", "sk-")):
         fail("That is SSH PUBLIC key text, not a CLIENT private-key file path. "
              "Enter the path to your existing local private key.")
@@ -839,9 +852,10 @@ def select_identity(explicit: str | None) -> str:
             continue
         default = str(candidate)
         break
-    terminal_note("STEP 4/5 - CLIENT authentication key (PRIVATE file).")
+    terminal_section("STEP 4/5 - CLIENT authentication key (PRIVATE file).")
     terminal_note("Select an existing key file on THIS CLIENT, or explicitly generate one.")
-    terminal_note("Do NOT paste a SHA256 fingerprint or the contents of a key here.")
+    terminal_note("Do NOT paste a SHA256 fingerprint or the contents of a key here.",
+                  tone="warn")
     while True:
         chosen = ask(explicit, "4/5 CLIENT private key FILE path", default)
         try:
@@ -1245,7 +1259,9 @@ def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
     interactive = (sys.stdin.isatty() and
                    any(x is None for x in (remote_ip, ssh_user, ssh_port, identity_file, fingerprint)))
     if interactive:
-        terminal_note("Configure SSH - traffic interception stays OFF. Enter b to cancel.", indent="")
+        terminal_section("CONFIGURE SSH / 5 STEPS")
+        terminal_note("Configure SSH - traffic interception stays OFF. Enter b to cancel.",
+                      tone="warn")
         terminal_note("Steps 1-3: remote SERVER. Step 4: CLIENT private key file.")
         terminal_note("Step 5: independently trusted SERVER host SHA256 fingerprint.")
     remote_ip = checked_field(remote_ip, "1/5 SERVER public IPv4", None,
@@ -1254,8 +1270,9 @@ def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
     ssh_port = checked_field(str(ssh_port) if ssh_port is not None else None,
                              "3/5 SERVER SSH port", "22", valid_port)
     if interactive:
-        terminal_note(f"SSH destination: {ssh_user}@{remote_ip}:{ssh_port}")
-        terminal_note("Next: select the private SSH identity kept only on this CLIENT.")
+        terminal_field("SSH destination", f"{ssh_user}@{remote_ip}:{ssh_port}")
+        terminal_note("Next: select the private SSH identity kept only on this CLIENT.",
+                      tone="heading")
     identity_file = select_identity(identity_file)
     cfg = validate_config({
         "remote_ip": remote_ip, "ssh_user": ssh_user, "ssh_port": ssh_port,
@@ -1263,9 +1280,11 @@ def configure(remote_ip: str | None, ssh_user: str | None, ssh_port: int | None,
     })
     candidates = scanned_host_identities(cfg["remote_ip"], cfg["ssh_port"])
     if interactive:
-        terminal_note("STEP 5/5 - SERVER host identity (PUBLIC fingerprint, not a file).")
-        terminal_note("On the trusted SERVER console, open option 12 and copy the recommended SHA256 fingerprint. Verify it out of band.")
-        terminal_note("Do not enter your CLIENT key path or paste SSH key contents here.")
+        terminal_section("STEP 5/5 - SERVER host identity (PUBLIC fingerprint, not a file).")
+        terminal_note("On the trusted SERVER console, open option 12 and copy the "
+                      "recommended SHA256 fingerprint. Verify it out of band.")
+        terminal_note("Do not enter your CLIENT key path or paste SSH key contents here.",
+                      tone="warn")
     for key_type, _, fp in candidates:
         say(f"Observed (UNTRUSTED) remote {key_type}: {fp}", "WARN")
     if not interactive:
@@ -1804,7 +1823,8 @@ def start_proxy() -> None:
         stop_and_recover("failed_activation")
         raise
     say(f"Proxy started in PENDING state; automatic rollback deadline ~10 minutes. Operation: {op}", "WARN")
-    say(f"From a NEW authenticated SSH session, run: sudo simple-connect confirm {op}")
+    say("From a NEW authenticated SSH session, run the following command:", "INFO")
+    print(f"sudo simple-connect confirm {op}")  # One intact, copy-ready command.
 
 
 def confirm(op: str) -> None:
@@ -2136,24 +2156,60 @@ def server_host_report(*, probe: bool = False) -> dict:
     return report
 
 
-def terminal_note(message: str, *, indent: str = "  ") -> None:
-    """Wrap explanatory text but never split the copy-ready fingerprint."""
-    width = max(24, min(88, shutil.get_terminal_size(fallback=(80, 24)).columns - 1))
-    for row in textwrap.wrap(message, width=max(18, width - len(indent)),
-                             break_long_words=False, break_on_hyphens=False):
-        print(indent + row)
+def terminal_note(message: str, *, indent: str = "  ",
+                  tone: str | None = None) -> None:
+    """Wrap guidance but never split long technical tokens or fingerprints."""
+    for row in textwrap.wrap(message, width=max(18, terminal_width() - len(indent)),
+                             break_long_words=False, break_on_hyphens=False) or [""]:
+        print(indent + (paint(row, tone) if tone else row))
+
+
+def terminal_section(label: str) -> None:
+    """Quiet grouping shared by the menu, diagnostics and onboarding."""
+    print()
+    terminal_note(label, tone="heading")
+
+
+def terminal_field(label: str, value: str, *, tone: str | None = None) -> None:
+    """Readable key/value groups; never include ANSI bytes in width calculation."""
+    head = f"{label}: "
+    width = terminal_width()
+    if len(head) > (width - 2) // 2:
+        # A long label and value compete at 40 columns. Stack them instead
+        # of leaving a confusing bare continuation without a visible label.
+        terminal_note(label + ":", indent="  ", tone="muted")
+        terminal_note(value, indent="    ", tone=tone)
+        return
+    rows = textwrap.wrap(head + value, width=max(18, width - 2),
+                         break_long_words=False, break_on_hyphens=False) or [head]
+    for row in rows:
+        if row.startswith(head):
+            print("  " + paint(label + ":", "muted") + " "
+                  + (paint(row[len(head):], tone) if tone else row[len(head):]))
+        else:
+            print("  " + (paint(row, tone) if tone else row))
+
+
+def terminal_warning(message: str) -> None:
+    terminal_note("WARNING: " + message, tone="warn")
 
 
 def show_advanced_server_host_fingerprints(info: dict) -> None:
-    """Detailed diagnostics are a separate operator choice, not the default."""
-    terminal_note("Advanced SERVER host key diagnostics (PUBLIC keys only):", indent="")
+    """All identities stay available, but do not crowd the primary choice."""
+    terminal_section("Advanced SERVER host key diagnostics (PUBLIC keys only):")
     for entry in info["keys"]:
-        terminal_note(f"{entry['type']}: {entry['fingerprint'] or 'no valid fingerprint'}")
-        terminal_note(f"Status: {entry['status']}", indent="    ")
-        terminal_note(f"Public path: {entry['path']}", indent="    ")
-        terminal_note(f"Private pair: {entry['private']}", indent="    ")
-    for note in info["notes"]:
-        terminal_note(f"WARNING: {note}")
+        print()
+        terminal_note(f"{entry['type']}: {entry['fingerprint'] or 'no valid fingerprint'}",
+                      tone="heading" if entry["enabled"] else "warn")
+        terminal_field("Status", entry["status"],
+                       tone="warn" if not entry["enabled"] else None)
+        terminal_field("Public path", entry["path"])
+        terminal_field("Private pair", entry["private"],
+                       tone="warn" if entry["private"] != "PAIR MATCH" else None)
+    if info["notes"]:
+        terminal_section("ADDITIONAL SSH DIAGNOSTICS")
+        for note in info["notes"]:
+            terminal_warning(note)
 
 
 def show_server_host_fingerprints(*, probe: bool = True, advanced: bool = False) -> dict:
@@ -2162,9 +2218,13 @@ def show_server_host_fingerprints(*, probe: bool = True, advanced: bool = False)
             ETC / "role").read_text().strip() != "server":
         fail("SERVER fingerprint action requires SERVER role; no client key is shown.")
     info = server_host_report(probe=probe)
-    terminal_note("SERVER SSH - copy the recommended PUBLIC host fingerprint:", indent="")
-    terminal_note(f"SSH service: {'ACTIVE (systemd)' if info['active'] else 'NOT VERIFIED ACTIVE'}")
-    terminal_note(f"Effective configured SSH port(s): {', '.join(map(str, info['ports'])) or 'UNKNOWN'}")
+    terminal_section("SERVER SSH / PUBLIC HOST IDENTITY")
+    terminal_field("SSH service",
+                   "ACTIVE (systemd)" if info["active"] else "NOT VERIFIED ACTIVE",
+                   tone="good" if info["active"] else "warn")
+    terminal_field("Effective configured SSH port(s)",
+                   ", ".join(map(str, info["ports"])) or "UNKNOWN",
+                   tone=None if info["ports"] else "warn")
 
     ready = [entry for entry in info["keys"]
              if entry["enabled"] and entry["fingerprint"]]
@@ -2188,9 +2248,10 @@ def show_server_host_fingerprints(*, probe: bool = True, advanced: bool = False)
     # choose the exact verified identity for the intended listener.
     ambiguous = len({(entry["type"], entry["fingerprint"]) for entry in best}) > 1
     if ambiguous:
-        terminal_note("WARNING: AMBIGUOUS SERVER identity: multiple distinct "
-                      "keys of the preferred algorithm. No single fingerprint "
-                      "can be recommended for all listeners.")
+        terminal_section("MANUAL SELECTION REQUIRED")
+        terminal_warning("AMBIGUOUS SERVER identity: multiple distinct "
+                         "keys of the preferred algorithm. No single fingerprint "
+                         "can be recommended for all listeners.")
         terminal_note("Inspect Advanced for exact fingerprints and observed "
                       "localhost ports. Verify the intended SERVER port and "
                       "its specific identity before configuring the CLIENT.")
@@ -2200,7 +2261,9 @@ def show_server_host_fingerprints(*, probe: bool = True, advanced: bool = False)
         friendly = ("ED25519 (ssh-ed25519)" if kind == "ssh-ed25519" else
                     "RSA (SHA-2 signatures only)" if kind == "ssh-rsa" else
                     "ECDSA (" + kind + ")")
-        terminal_note(f"Recommended SERVER host key: {friendly}")
+        terminal_section("RECOMMENDED SERVER HOST KEY")
+        terminal_field("Recommended SERVER host key", friendly, tone="heading")
+        terminal_note("Copy this PUBLIC SHA256 fingerprint to the CLIENT:", tone="heading")
         print(selected["fingerprint"])  # One complete, directly copyable token.
         ports = sorted(observed_ports.get((kind, selected["fingerprint"]), set()))
         if probe and ports:
@@ -2210,76 +2273,148 @@ def show_server_host_fingerprints(*, probe: bool = True, advanced: bool = False)
         else:
             terminal_note("Verified configured local key pair only. The SSH "
                           "listener and remote authentication are UNVERIFIED.")
+        terminal_section("NEXT STEP ON CLIENT")
         terminal_note("On the CLIENT: option 3 (Configure SSH), enter the "
                       "SERVER IP/user/port, choose a CLIENT private key FILE, "
-                      "then paste this SHA256 value at step 5.")
+                      "then paste this SHA256 value at step 5.", tone="heading")
     else:
-        terminal_note("NO SAFE SUPPORTED SERVER host identity verified; "
-                      "do not pin an arbitrary key. Inspect Advanced diagnostics.")
+        terminal_section("NO RECOMMENDATION AVAILABLE")
+        terminal_warning("NO SAFE SUPPORTED SERVER host identity verified; "
+                         "do not pin an arbitrary key. Inspect Advanced diagnostics.")
 
+    warnings = []
     unready = [entry for entry in info["keys"] if not entry["enabled"]]
     if unready:
-        terminal_note(f"WARNING: {len(unready)} other host key(s) are missing, "
-                      "disabled, unsupported or unsafe; see Advanced diagnostics.")
+        warnings.append(f"{len(unready)} other host key(s) are missing, "
+                        "disabled, unsupported or unsafe; see Advanced diagnostics.")
     if not info["active"]:
-        terminal_note("WARNING: SSH service not confirmed active.")
+        warnings.append("SSH service not confirmed active.")
     if not info["ports"]:
-        terminal_note("WARNING: SSH port is unknown; inspect effective sshd configuration.")
+        warnings.append("SSH port is unknown; inspect effective sshd configuration.")
     if len(info["ports"]) > 1:
-        terminal_note("WARNING: Multiple configured ports; verify which listener "
-                      "your CLIENT can actually reach.")
+        warnings.append("Multiple configured ports; verify which listener "
+                        "your CLIENT can actually reach.")
     if probe and not info["observed"]:
-        terminal_note("WARNING: No matching localhost host key observed. "
-                      "An external-only listener may behave differently.")
+        warnings.append("No matching localhost host key observed. "
+                        "An external-only listener may behave differently.")
     if not probe:
-        terminal_note("Local files and sshd configuration are not proof of an "
-                      "actual listening SSH connection.")
-    terminal_note("Use Advanced diagnostics for all algorithms, file paths "
-                  "and readiness details. No sshd or key changes were made.")
+        warnings.append("Local files and sshd configuration are not proof of an "
+                        "actual listening SSH connection.")
+    if warnings:
+        terminal_section("WARNINGS / LIMITATIONS")
+        for warning in warnings:
+            terminal_warning(warning)
+    terminal_note("Advanced diagnostics show all algorithms, paths and readiness; "
+                  "no sshd or key changes were made.", tone="muted")
     if advanced:
         show_advanced_server_host_fingerprints(info)
     return info
 
 
 def status() -> None:
-    role = ETC / "role"
-    if role.is_symlink():
+    """Read-only state report: colors describe local observations, not field acceptance."""
+    role_path = ETC / "role"
+    if role_path.is_symlink():
         fail("Unsafe role path (symlink); status cannot be trusted.")
-    if not role.is_file():
+    if not role_path.is_file():
         print(f"Simple Connect: {VERSION}")
-        print("Role: NOT INSTALLED")
-        print("State: NOT INSTALLED (no Simple Connect network state verified)")
+        terminal_field("Role", "NOT INSTALLED", tone="warn")
+        terminal_field("State", "NOT INSTALLED (no Simple Connect network state verified)",
+                       tone="warn")
         return
-    if role.read_text().strip() == "server":
+    role = role_path.read_text().strip()
+    if role == "server":
         print(f"Simple Connect: {VERSION} | SERVER (no proxy/tunnel)")
         show_server_host_fingerprints(probe=False)
         return
-    if role.read_text().strip() != "client":
+    if role != "client":
         fail("Unknown Simple Connect role; inspect role file, no network state inferred.")
     state = read_json(STATE, {"status": "UNKNOWN"})
-    print(f"Simple Connect: {VERSION}")
-    role = (ETC / "role").read_text().strip().upper() if (ETC / "role").is_file() else "NOT SET UP"
-    print(f"Role: {role}")
     label = str(state.get("status", "UNKNOWN"))
-    tone = "good" if label in ("DIRECT", "ACTIVE") else "warn" if label == "PENDING" else "error"
-    print(f"State: {paint(label, tone)}")
     active = is_active(SERVICE)
-    print(f"Proxy service: {paint('running' if active else 'stopped', 'warn' if active else 'good')}")
-    if state.get("status") != "DIRECT":
-        print(f"Proxy listener port: {proxy_port(state)}")
     guard_active = is_active(GUARD_TIMER)
-    print(f"Independent guard: {paint('running' if guard_active else 'not active', 'good' if guard_active else 'warn')}")
-    table = current_table(state) if shutil.which("nft") and state.get("status") != "DIRECT" else None
-    print(f"Owned nftables table: {'present' if table else 'absent'}")
-    if state.get("status") == "DIRECT" and shutil.which("nft") and any_proxy_tables():
-        print("WARNING: untracked sshuttle nftables table(s) present; inspect manually.")
-    if table and state.get("table_sha256"):
-        print(f"Table identity: {'MATCH' if table_is_ours(table, state['table_sha256']) else 'CHANGED'}")
-    if state.get("status") == "PENDING":
-        print(f"Confirmation operation: {state.get('op')}")
-        print(f"Confirmation expires at UTC timestamp: {state.get('deadline')}")
+    nft_available = shutil.which("nft") is not None
+    table = current_table(state) if nft_available and label != "DIRECT" else None
+    untracked = any_proxy_tables() if label == "DIRECT" and nft_available else False
+    expected_sha = state.get("table_sha256")
+    # table_hash() persists hashlib.hexdigest(): exactly 64 lowercase hex
+    # characters. Noncanonical/malformed values cannot establish ownership,
+    # and must not be reported as a valid but changed recorded fingerprint.
+    valid_sha = (isinstance(expected_sha, str)
+                 and re.fullmatch(r"[0-9a-f]{64}", expected_sha) is not None)
+    verified_table = (table is not None and valid_sha
+                      and table_is_ours(table, expected_sha))
+    # ACTIVE is a persisted state label, not proof of safe firewall ownership.
+    # Do not give that overall label a green health cue while the observation
+    # is unverifiable, changed, missing, or the service/guard is unhealthy.
+    if label == "ACTIVE":
+        if not active or not guard_active or (nft_available and table is None):
+            tone = "error"
+        elif not nft_available or not valid_sha:
+            tone = "warn"
+        else:
+            tone = "good" if verified_table else "error"
+    elif label == "DIRECT":
+        tone = ("error" if untracked or active else
+                "good" if nft_available and guard_active else "warn")
+    else:
+        tone = "warn" if label == "PENDING" else "error"
+    print(f"Simple Connect: {VERSION}")
+    terminal_section("CONNECTION")
+    terminal_field("Role", "CLIENT")
+    terminal_field("State", label, tone=tone)
+    service_tone = ("good" if active == (label in ("PENDING", "ACTIVE"))
+                    else "error")
+    terminal_field("Proxy service", "running" if active else "stopped",
+                   tone=service_tone)
+    if label != "DIRECT":
+        terminal_field("Proxy listener port", str(proxy_port(state)))
+    terminal_section("RECOVERY / OWNED FIREWALL")
+    terminal_field("Independent guard", "running" if guard_active else "not active",
+                   tone="good" if guard_active else "warn")
+    if label == "DIRECT":
+        # Absence is only a healthy observation after an actual nft inspection.
+        if not nft_available:
+            terminal_field("Owned nftables table", "UNVERIFIED (nft unavailable)", tone="warn")
+        else:
+            terminal_field("Owned nftables table",
+                           "untracked table(s) present" if untracked else "absent",
+                           tone="error" if untracked else "good")
+            if untracked:
+                terminal_warning("Untracked sshuttle nftables table(s) present; inspect manually.")
+    elif not nft_available:
+        terminal_field("Owned nftables table", "UNVERIFIED (nft unavailable)", tone="warn")
+        terminal_field("Table identity", "UNVERIFIED (cannot inspect)", tone="warn")
+    elif table is None:
+        terminal_field("Owned nftables table", "absent", tone="error")
+        terminal_field("Table identity", "ABSENT", tone="error")
+    else:
+        # A matching table name proves presence only, never ownership. Do not
+        # show green unless the *full* persisted snapshot hash verifies.
+        if not valid_sha:
+            missing = expected_sha is None or expected_sha == ""
+            identity = ("UNVERIFIED (no saved SHA256)" if missing
+                        else "UNVERIFIED (invalid SHA256)")
+            table_tone = "warn"
+        elif verified_table:
+            identity, table_tone = "MATCH", "good"
+        else:
+            identity, table_tone = "CHANGED", "error"
+        terminal_field("Owned nftables table", "present", tone=table_tone)
+        terminal_field("Table identity", identity, tone=table_tone)
+        if identity.startswith("UNVERIFIED"):
+            terminal_warning("Table ownership cannot be verified without a valid saved SHA256; "
+                             "do not adopt or delete it.")
+        elif identity == "CHANGED":
+            terminal_warning("Table differs from recorded ownership SHA256; "
+                             "do not adopt or delete it.")
+    if label == "PENDING":
+        terminal_field("Confirmation operation", str(state.get("op")))
+        terminal_field("Confirmation expires at UTC timestamp", str(state.get("deadline")))
     if state.get("last_recovery"):
-        print(f"Last recovery reason: {state['last_recovery']}")
+        terminal_field("Last recovery reason", str(state["last_recovery"]))
+    terminal_note("These are local checks; external egress, DNS leaks and application "
+                  "reachability require separate field verification.", tone="muted")
 
 
 def test_path(url: str) -> None:
@@ -2306,6 +2441,7 @@ def test_path(url: str) -> None:
 
 
 def logs() -> None:
+    terminal_section("RECENT PROXY / GUARD JOURNAL (100 LINES)")
     run(["journalctl", "--no-pager", "-n", "100", "-u", SERVICE,
          "-u", GUARD_UNIT], timeout=12, capture=False)
 
@@ -2553,6 +2689,7 @@ def uninstall(yes: bool) -> None:
 
 
 def clear_menu() -> None:
+    # Screen clearing is a terminal control, not a color; NO_COLOR does not disable it.
     if (sys.stdout.isatty()
             and os.environ.get("TERM", "") not in ("", "dumb")):
         print("\033[2J\033[H", end="", flush=True)
@@ -2667,46 +2804,55 @@ def menu_snapshot() -> dict[str, str]:
 
 
 def menu_header(section: str = "MAIN MENU") -> dict:
-    width = max(24, min(88, shutil.get_terminal_size(fallback=(80, 24)).columns - 1))
-    line = "-" * width
+    width = terminal_width()
     info = menu_snapshot()
     state = info["state"]
     state_tone = ("good" if state in ("DIRECT", "ACTIVE") and not info["note"]
-                  else "warn" if state in ("PENDING", "NOT INSTALLED", "SSH SERVER (no tunnel)") and not info["note"]
-                  else "error")
+                  else "warn" if state in ("PENDING", "NOT INSTALLED", "SSH SERVER (no tunnel)")
+                  and not info["note"] else "error")
     print(paint("=" * width, "title"))
     print(f"  {paint('SIMPLE CONNECT', 'title')} v{VERSION}")
     print(f"  {paint(section, 'heading')}")
-    print(paint(line, "muted"))
-
-    def item(label: str, value: str, tone: str = "heading") -> None:
-        content = f"{label}: {value}"
-        lines = textwrap.wrap(content, width=max(12, width - 4),
-                              break_long_words=True, break_on_hyphens=False)
-        for index, row in enumerate(lines):
-            print("  " + (paint(row, tone) if index == 0 and label == "Link" else row))
-
-    item("Role", info["role"])
-    item("Local IPv4", info["local"])
-    item("Link", state, state_tone)
-    item("Service", info["service"])
-    item("Guard", info["guard"])
+    print(paint("-" * width, "muted"))
+    terminal_field("Role", info["role"])
+    terminal_field("Link", state, tone=state_tone)
+    terminal_field("Local IPv4", info["local"])
     if info["role"] == "SERVER":
-        item("Server host keys", info["key"])
-        item("SSH readiness", "UNVERIFIED until listener and authenticated SSH test")
+        terminal_field("SSH service", info["service"],
+                       tone="good" if info["service"] == "RUNNING" else "warn")
+        terminal_field("SSH readiness", "Host keys and external login must be verified",
+                       tone="warn")
     else:
+        terminal_field("Proxy service", info["service"],
+                       tone="good" if info["service"] == "RUNNING" and state in ("ACTIVE", "PENDING")
+                       or info["service"] == "STOPPED" and state == "DIRECT" else "warn")
+        terminal_field("Guard", info["guard"],
+                       tone="good" if info["guard"] == "RUNNING" else "warn")
         has_remote = info["role"] == "CLIENT" and info["remote"] not in ("NOT CONFIGURED", "INVALID CONFIG")
         key_ready = info["key"].startswith("PRESENT: ")
         configured = "KEY PRESENT (SSH untested)" if has_remote and key_ready else (
             "INCOMPLETE" if has_remote else "NO")
-        item("SSH configured", configured)
-        item("Remote SSH", info["remote"])
-        item("Client identity", info["key"])
+        terminal_field("SSH configured", configured,
+                       tone="heading" if has_remote and key_ready else "warn")
+        if has_remote:
+            terminal_field("Remote SSH", info["remote"])
+        if info["role"] == "CLIENT":
+            terminal_field("Client key", "PRESENT (login untested)" if key_ready else info["key"],
+                           tone="heading" if key_ready else "warn")
     if info["note"]:
-        item("ATTENTION", info["note"])
-    print(paint(line, "muted"))
+        terminal_warning("ATTENTION: " + info["note"])
+    print(paint("-" * width, "muted"))
     return info
 
+
+def menu_option(number: int, label: str, *, tone: str | None = None) -> None:
+    """Stable numeric shortcuts, with color reserved for action consequences."""
+    print(f"  {number:>2}) " + (paint(label, tone) if tone else label))
+
+
+def menu_group(title: str) -> None:
+    print()
+    print(f"  {paint(title, 'heading')}")
 
 
 def pause_menu() -> None:
@@ -2720,11 +2866,13 @@ def ssh_access_menu() -> None:
     while True:
         clear_menu()
         menu_header("SSH ACCESS")
-        print("  1) Enroll selected PUBLIC key")
-        print("  2) Show PUBLIC key")
-        print("  3) Test authenticated SSH / Python")
-        print("  4) Configure SSH / choose key")
-        print("  0) Back to main menu\n")
+        menu_group("CLIENT SSH / PUBLIC KEY ACCESS")
+        menu_option(1, "Enroll selected PUBLIC key", tone="warn")
+        menu_option(2, "Show PUBLIC key")
+        menu_option(3, "Test authenticated SSH / Python")
+        menu_option(4, "Configure SSH / choose key")
+        menu_option(0, "Back to main menu")
+        print()
         try:
             choice = input(f"{paint('Choose', 'heading')}: ").strip()
             if choice == "0":
@@ -2754,34 +2902,32 @@ def menu() -> None:
         clear_menu()
         info = menu_header()
         role = info.get("role", "") if isinstance(info, dict) else ""
-        print(f"  {paint('SETUP', 'heading')}")
-        print("   1) Setup remote SERVER" + (" (other role)" if role == "CLIENT" else ""))
-        print("   2) Setup Iran CLIENT" + (" (other role)" if role == "SERVER" else ""))
-        print("   3) Configure SSH (CLIENT only)" if role == "SERVER"
-              else "   3) Configure SSH connection")
-        print(f"  {paint('SSH ACCESS', 'heading')}")
-        print("  11) SSH keys/access (CLIENT only)" if role == "SERVER"
-              else "  11) SSH keys / access")
-        print(f"  {paint('CONNECTION', 'heading')}")
-        print("   4) Turn ON (CLIENT only)" if role == "SERVER"
-              else f"   4) {paint('Turn ON', 'warn')} (field approval)")
-        print("   5) Confirm ON (CLIENT only)" if role == "SERVER"
-              else "   5) Confirm ON (fresh SSH)")
-        print("   6) Turn OFF (CLIENT only)" if role == "SERVER"
-              else f"   6) {paint('Turn OFF', 'good')}")
-        print(f"  {paint('DIAGNOSTICS', 'heading')}")
-        print("   7) Status")
-        print("   8) Test SSH (CLIENT only)" if role == "SERVER"
-              else "   8) Test SSH + HTTPS")
-        print("   9) Logs (CLIENT only)" if role == "SERVER"
-              else "   9) Logs")
-        print(f"  {paint('SERVER INFORMATION', 'heading')}")
-        print("  12) SERVER fingerprints/Advanced" if role == "SERVER"
-              else "  12) Show SERVER SSH fingerprints" if role != "CLIENT"
-              else "  12) SERVER keys (SERVER only)")
-        print(f"  {paint('MAINTENANCE', 'heading')}")
-        print(f"  10) {paint('Uninstall', 'error')} (destructive)")
-        print("   0) Exit\n")
+        menu_group("SETUP")
+        menu_option(1, "Setup remote SERVER" + (" (other role)" if role == "CLIENT" else ""))
+        menu_option(2, "Setup Iran CLIENT" + (" (other role)" if role == "SERVER" else ""))
+        menu_option(3, "Configure SSH (CLIENT only)" if role == "SERVER"
+                    else "Configure SSH connection")
+        menu_group("CONNECTION")
+        menu_option(4, "Turn ON (CLIENT only)" if role == "SERVER"
+                    else "Turn ON (field approval)", tone=None if role == "SERVER" else "warn")
+        menu_option(5, "Confirm ON (CLIENT only)" if role == "SERVER"
+                    else "Confirm ON (fresh SSH)")
+        menu_option(6, "Turn OFF (CLIENT only)" if role == "SERVER"
+                    else "Turn OFF", tone=None if role == "SERVER" else "good")
+        menu_group("DIAGNOSTICS")
+        menu_option(7, "Status")
+        menu_option(8, "Test SSH (CLIENT only)" if role == "SERVER"
+                    else "Test SSH + HTTPS")
+        menu_option(9, "Logs (CLIENT only)" if role == "SERVER" else "Logs")
+        menu_group("OTHER TOOLS / MAINTENANCE")
+        menu_option(10, "Uninstall (destructive)", tone="error")
+        menu_option(11, "SSH keys/access (CLIENT only)" if role == "SERVER"
+                    else "SSH keys / access")
+        menu_option(12, "SERVER fingerprints/Advanced" if role == "SERVER"
+                    else "Show SERVER SSH fingerprints" if role != "CLIENT"
+                    else "SERVER keys (SERVER only)")
+        menu_option(0, "Exit")
+        print()
         try:
             choice = input(f"{paint('Choose', 'heading')}: ").strip()
             if choice == "0":
@@ -2809,7 +2955,7 @@ def menu() -> None:
             elif choice == "9":
                 logs()
             elif choice == "10":
-                uninstall(input("Type YES to uninstall: ").strip() == "YES")
+                uninstall(input(paint("Type YES to uninstall: ", "error")).strip() == "YES")
             elif choice == "11":
                 if role == "SERVER":
                     say("SSH keys/access is CLIENT-only. On this SERVER, use option 12 "
