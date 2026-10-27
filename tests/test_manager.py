@@ -121,6 +121,10 @@ class SimpleConnectTests(unittest.TestCase):
                         sc.service_run()
                         args=execv.call_args.args[1]
                         self.assertIn("--method=nft",args)
+                        self.assertEqual(sc.SSHUTTLE_LATENCY_BUFFER_SIZE, 1_048_576)
+                        self.assertEqual(args.count("--latency-buffer-size"), 1)
+                        self.assertEqual(args[args.index("--latency-buffer-size")+1], "1048576")
+                        self.assertNotIn("--no-latency-control", args)
                         for cidr in expected:
                             self.assertIn(cidr,args)
                         self.assertEqual(args[-1],"0.0.0.0/0")

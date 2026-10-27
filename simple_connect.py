@@ -33,9 +33,11 @@ import time
 import urllib.request
 import zipfile
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 SCHEMA_VERSION = 1
 SSHUTTLE_VERSION = "2.0.0"
+# Retain upstream latency control while allowing a full high-RTT bandwidth window.
+SSHUTTLE_LATENCY_BUFFER_SIZE = 1_048_576
 WHEEL_SHA256 = "506a8cad2f047ca42f0d784654cb3459e2193bfad79d0a03734e0e07473f2bbb"
 WHEEL_URL = (
     "https://files.pythonhosted.org/packages/25/1d/"
@@ -1949,6 +1951,7 @@ def service_run() -> None:
     excluded = stored_exclusions(state)
     argv = [
         "/usr/bin/python3", "-m", "sshuttle", "--method=nft", "--dns",
+        "--latency-buffer-size", str(SSHUTTLE_LATENCY_BUFFER_SIZE),
         "--listen", f"127.0.0.1:{proxy_port(state)}", "--remote", "sc-remote",
         "--ssh-cmd", f"ssh -F {SSH_CONF} -o BatchMode=yes",
     ]
