@@ -1,0 +1,48 @@
+schemaVersion: achworks.dev/v1alpha1
+kind: Component
+
+metadata:
+  name: simple-connect
+  title: Simple Connect
+  description: Lightweight Linux manager for explicitly activated outbound IPv4 TCP and supported DNS forwarding through a trusted SSH endpoint using sshuttle.
+
+spec:
+  type: linux-server-utility
+  lifecycle: active
+  system: simple-connect
+  ownership: AChWorks
+
+  technology:
+    languages:
+      - Python
+      - Bash
+    runtimes:
+      - Linux
+      - systemd
+      - nftables
+      - sshuttle
+
+  capabilities:
+    provides:
+      - ssh-outbound-tcp-forwarding
+      - guarded-connectivity-activation
+      - owned-network-recovery
+    consumes:
+      - sshuttle
+
+  interfaces:
+    - type: cli
+      name: simple-connect
+      contract: docs/OPERATIONS.md
+
+  dependencies:
+    - sshuttle
+
+  documentation:
+    path: docs/
+
+  source:
+    repository: AChWorks/simple-connect
+    url: https://github.com/AChWorks/simple-connect
+
+  extensions: {}
